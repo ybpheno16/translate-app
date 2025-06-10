@@ -45,6 +45,7 @@ function LanguageBridgeWithVideo() {
   const [status, setStatus] = useState('offline');
   const [error, setError] = useState('');
   const [videoStatus, setVideoStatus] = useState('');
+  const [translationStatus, setTranslationStatus] = useState('');
   
   // Video state
   const [localStream, setLocalStream] = useState(null);
@@ -59,6 +60,7 @@ function LanguageBridgeWithVideo() {
   const lastTranscriptRef = useRef('');
   const unsubscribersRef = useRef([]);
   const peerConnectionRef = useRef(null);
+  const processedMessageIds = useRef(new Set());
 
   // Languages with better organization (memoized to prevent re-renders)
   const languages = useMemo(() => [
@@ -83,6 +85,11 @@ function LanguageBridgeWithVideo() {
     { code: 'pt-BR', name: 'Portuguese', native: 'Português', flag: '🇧🇷' },
     { code: 'it-IT', name: 'Italian', native: 'Italiano', flag: '🇮🇹' }
   ], []);
+
+  // Get other users who are online
+  const getOtherUsers = useCallback(() => {
+    return Object.values(connectedUsers).filter(user => user.id !== userId && user.isOnline);
+  }, [connectedUsers, userId]);
 
   // Initialize media devices
   const initializeMedia = useCallback(async () => {
@@ -293,7 +300,7 @@ function LanguageBridgeWithVideo() {
     if (!text.trim() || !apiKey || fromLang === toLang) return text;
     
     try {
-      setStatus('translating');
+      setTranslationStatus('🤖 Translating...');
       const fromLangInfo = languages.find(l => l.code === fromLang);
       const toLangInfo = languages.find(l => l.code === toLang);
       
@@ -333,12 +340,16 @@ function LanguageBridgeWithVideo() {
       // Clean up translation (remove quotes, explanations)
       translation = translation.replace(/^["']|["']$/g, '');
       
-      setStatus('online');
+      setTranslationStatus('✅ Translation complete');
+      setTimeout(() => setTranslationStatus(''), 2000);
+      
+      console.log('✅ Translation:', { from: text, to: translation, fromLang, toLang });
       return translation;
     } catch (error) {
-      console.error('Translation error:', error);
+      console.error('❌ Translation error:', error);
       setError(`Translation failed: ${error.message}`);
-      setStatus('error');
+      setTranslationStatus('❌ Translation failed');
+      setTimeout(() => setTranslationStatus(''), 3000);
       return `[Translation Error: ${text}]`;
     }
   }, [apiKey, languages]);
@@ -347,13 +358,15 @@ function LanguageBridgeWithVideo() {
   const speakText = useCallback((text, languageCode) => {
     if (!text || isMuted || !window.speechSynthesis) return;
     
+    console.log('🗣️ Speaking:', { text, languageCode });
+    
     // Stop any ongoing speech
     speechSynthesis.cancel();
     
     const utterance = new SpeechSynthesisUtterance(text);
     utterance.lang = languageCode;
-    utterance.rate = 0.85;
-    utterance.volume = 0.9;
+    utterance.rate = 0.9;
+    utterance.volume = 0.8;
     utterance.pitch = 1.0;
     
     // Try to find the best voice for the language
@@ -367,14 +380,47 @@ function LanguageBridgeWithVideo() {
     
     if (preferredVoice) {
       utterance.voice = preferredVoice;
+      console.log('🎵 Using voice:', preferredVoice.name);
     }
     
+    utterance.onstart = () => {
+      console.log('🗣️ Speech started');
+    };
+    
+    utterance.onend = () => {
+      console.log('🗣️ Speech ended');
+    };
+    
     utterance.onerror = (event) => {
-      console.error('Speech synthesis error:', event);
+      console.error('❌ Speech synthesis error:', event);
     };
     
     speechSynthesis.speak(utterance);
   }, [isMuted]);
+
+  // Send translation message to Firebase
+  const sendTranslationMessage = useCallback(async (originalText, translatedTexts) => {
+    if (!currentSessionCode) return;
+
+    const messageData = {
+      senderId: userId,
+      senderName: userName,
+      originalText: originalText,
+      originalLang: userLanguage,
+      translatedTexts: translatedTexts, // Object with target languages as keys
+      timestamp: serverTimestamp(),
+      type: 'translation',
+      messageId: `${userId}_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
+    };
+    
+    try {
+      await push(ref(database, `sessions/${currentSessionCode}/messages`), messageData);
+      console.log('✅ Translation message sent:', messageData);
+    } catch (error) {
+      console.error('❌ Failed to send translation message:', error);
+      setError('Failed to send translation message');
+    }
+  }, [currentSessionCode, userId, userName, userLanguage]);
 
   // Enhanced speech recognition with better handling
   const setupSpeechRecognition = useCallback(() => {
@@ -395,6 +441,7 @@ function LanguageBridgeWithVideo() {
       setIsListening(true);
       setStatus('listening');
       setError('');
+      console.log('🎤 Speech recognition started');
     };
 
     recognition.onresult = async (event) => {
@@ -421,46 +468,45 @@ function LanguageBridgeWithVideo() {
         lastTranscriptRef.current += cleanText + ' ';
         setMyTranscript(lastTranscriptRef.current);
         
-        // Find target language from connected users
-        const otherUsers = Object.values(connectedUsers).filter(u => u.id !== userId);
+        console.log('🗣️ Final transcript:', cleanText);
+        
+        // Get all other users and their languages
+        const otherUsers = getOtherUsers();
+        console.log('👥 Other users for translation:', otherUsers);
+        
         if (otherUsers.length > 0) {
-          const targetLang = otherUsers[0].language;
-          
           setStatus('translating');
-          const translation = await translateText(cleanText, userLanguage, targetLang);
           
-          // Send to Firebase
-          if (currentSessionCode) {
-            const messageData = {
-              senderId: userId,
-              senderName: userName,
-              originalText: cleanText,
-              originalLang: userLanguage,
-              translatedText: translation,
-              translatedLang: targetLang,
-              timestamp: serverTimestamp(),
-              type: 'speech'
-            };
-            
-            try {
-              await push(ref(database, `sessions/${currentSessionCode}/messages`), messageData);
-              console.log('✅ Message sent:', messageData);
-            } catch (error) {
-              console.error('❌ Failed to send message:', error);
-              setError('Failed to send message');
+          // Create translations for each user's language
+          const translatedTexts = {};
+          
+          for (const user of otherUsers) {
+            if (user.language !== userLanguage) {
+              try {
+                const translation = await translateText(cleanText, userLanguage, user.language);
+                translatedTexts[user.language] = translation;
+                console.log(`✅ Translated for ${user.name} (${user.language}):`, translation);
+              } catch (error) {
+                console.error(`❌ Translation failed for ${user.name}:`, error);
+                translatedTexts[user.language] = `[Translation Error: ${cleanText}]`;
+              }
             }
           }
           
-          // Auto speak original text back (confirmation)
-          if (autoSpeak) {
-            setTimeout(() => speakText(cleanText, userLanguage), 500);
+          // Send translations to Firebase
+          if (Object.keys(translatedTexts).length > 0) {
+            await sendTranslationMessage(cleanText, translatedTexts);
           }
+          
+          setStatus('online');
+        } else {
+          console.log('👤 No other users to translate for');
         }
       }
     };
 
     recognition.onerror = (event) => {
-      console.error('Speech recognition error:', event.error);
+      console.error('❌ Speech recognition error:', event.error);
       if (event.error === 'no-speech') {
         // Don't show error for no speech
         return;
@@ -478,22 +524,63 @@ function LanguageBridgeWithVideo() {
       setIsListening(false);
       if (isConnected && !error) {
         setStatus('online');
-        // Auto-restart recognition
+        // Auto-restart recognition if still connected
         setTimeout(() => {
-          try {
-            recognition.start();
-          } catch (e) {
-            console.log('Recognition restart failed:', e);
+          if (isConnected && recognitionRef.current === recognition) {
+            try {
+              recognition.start();
+              console.log('🔄 Speech recognition restarted');
+            } catch (e) {
+              console.log('❌ Recognition restart failed:', e);
+            }
           }
         }, 1000);
       }
     };
 
     return recognition;
-  }, [userLanguage, userId, userName, currentSessionCode, connectedUsers, translateText, autoSpeak, speakText, isConnected, error]);
+  }, [userLanguage, getOtherUsers, translateText, sendTranslationMessage, isConnected, error]);
+
+  // Handle received translation messages
+  const handleReceivedMessage = useCallback((message) => {
+    // Skip our own messages
+    if (message.senderId === userId) return;
+    
+    // Skip already processed messages
+    if (processedMessageIds.current.has(message.messageId)) return;
+    processedMessageIds.current.add(message.messageId);
+    
+    console.log('📨 Received message:', message);
+    
+    if (message.type === 'translation') {
+      // Get the translation for our language
+      const translationForMe = message.translatedTexts[userLanguage];
+      
+      if (translationForMe) {
+        console.log('🔄 Translation for me:', translationForMe);
+        
+        // Update received transcript
+        setReceivedTranscript(prev => prev + translationForMe + ' ');
+        
+        // Auto speak the translation
+        if (autoSpeak) {
+          setTimeout(() => {
+            speakText(translationForMe, userLanguage);
+          }, 500);
+        }
+        
+        // Show in status
+        setTranslationStatus(`📨 Received: ${message.senderName}`);
+        setTimeout(() => setTranslationStatus(''), 3000);
+      }
+    }
+  }, [userId, userLanguage, autoSpeak, speakText]);
 
   // Setup Firebase listeners
   const setupFirebaseListeners = useCallback((sessionCode) => {
+    // Clear processed messages when setting up new listeners
+    processedMessageIds.current.clear();
+    
     // Listen to users
     const usersRef = ref(database, `sessions/${sessionCode}/users`);
     const unsubscribeUsers = onValue(usersRef, (snapshot) => {
@@ -515,7 +602,7 @@ function LanguageBridgeWithVideo() {
     });
     unsubscribersRef.current.push(unsubscribeUsers);
     
-    // Listen to messages
+    // Listen to messages with real-time processing
     const messagesRef = ref(database, `sessions/${sessionCode}/messages`);
     const unsubscribeMessages = onValue(messagesRef, (snapshot) => {
       const messagesData = snapshot.val() || {};
@@ -524,21 +611,10 @@ function LanguageBridgeWithVideo() {
       
       setMessages(messagesList);
       
-      // Handle received messages
-      const latestMessage = messagesList[messagesList.length - 1];
-      if (latestMessage && 
-          latestMessage.senderId !== userId && 
-          latestMessage.type === 'speech') {
-        
-        setReceivedTranscript(prev => prev + latestMessage.translatedText + ' ');
-        
-        // Auto speak translation
-        if (autoSpeak) {
-          setTimeout(() => {
-            speakText(latestMessage.translatedText, userLanguage);
-          }, 1000);
-        }
-      }
+      // Process new messages
+      messagesList.forEach(message => {
+        handleReceivedMessage(message);
+      });
     });
     unsubscribersRef.current.push(unsubscribeMessages);
     
@@ -564,7 +640,7 @@ function LanguageBridgeWithVideo() {
     });
     unsubscribersRef.current.push(unsubscribeSignaling);
     
-  }, [userId, autoSpeak, speakText, userLanguage, isVideoEnabled, createOffer, handleOffer, handleAnswer, handleIceCandidate, isCallInitiator]);
+  }, [userId, isVideoEnabled, createOffer, handleOffer, handleAnswer, handleIceCandidate, isCallInitiator, handleReceivedMessage]);
 
   // Create session with video setup
   const createSession = useCallback(async () => {
@@ -595,6 +671,7 @@ function LanguageBridgeWithVideo() {
       setReceivedTranscript('');
       setIsCallInitiator(false);
       lastTranscriptRef.current = '';
+      processedMessageIds.current.clear();
       
       // Add user to Firebase session
       const userData = {
@@ -658,6 +735,7 @@ function LanguageBridgeWithVideo() {
       setReceivedTranscript('');
       setIsCallInitiator(false);
       lastTranscriptRef.current = '';
+      processedMessageIds.current.clear();
       
       // Add user to Firebase session
       const userData = {
@@ -696,17 +774,24 @@ function LanguageBridgeWithVideo() {
       return;
     }
     
+    const otherUsers = getOtherUsers();
+    if (otherUsers.length === 0) {
+      setError('No other users connected to translate for');
+      return;
+    }
+    
     const recognition = setupSpeechRecognition();
     if (recognition) {
       recognitionRef.current = recognition;
       try {
         recognition.start();
+        console.log('🎤 Started speech recognition');
       } catch (error) {
-        console.error('Recognition start failed:', error);
+        console.error('❌ Recognition start failed:', error);
         setError('Failed to start speech recognition');
       }
     }
-  }, [apiKey, setupSpeechRecognition]);
+  }, [apiKey, setupSpeechRecognition, getOtherUsers]);
 
   // Stop listening
   const stopListening = useCallback(() => {
@@ -716,6 +801,7 @@ function LanguageBridgeWithVideo() {
     }
     setIsListening(false);
     setStatus('online');
+    console.log('🛑 Stopped speech recognition');
   }, []);
 
   // Toggle video
@@ -814,8 +900,10 @@ function LanguageBridgeWithVideo() {
     setIsVideoEnabled(false);
     setStatus('offline');
     setVideoStatus('');
+    setTranslationStatus('');
     setIsCallInitiator(false);
     lastTranscriptRef.current = '';
+    processedMessageIds.current.clear();
   }, [localStream, remoteStream, stopListening, currentSessionCode, userId]);
 
   // Clear transcripts
@@ -823,12 +911,8 @@ function LanguageBridgeWithVideo() {
     setMyTranscript('');
     setReceivedTranscript('');
     lastTranscriptRef.current = '';
+    processedMessageIds.current.clear();
   }, []);
-
-  // Get other users info
-  const getOtherUsers = () => {
-    return Object.values(connectedUsers).filter(user => user.id !== userId);
-  };
 
   // Effect to handle media when video state changes
   useEffect(() => {
@@ -977,6 +1061,19 @@ function LanguageBridgeWithVideo() {
               fontSize: '14px'
             }}>
               {videoStatus}
+            </div>
+          )}
+
+          {translationStatus && (
+            <div style={{
+              padding: '8px 16px',
+              borderRadius: '20px',
+              background: '#fef3c7',
+              color: '#92400e',
+              fontWeight: 'bold',
+              fontSize: '14px'
+            }}>
+              {translationStatus}
             </div>
           )}
         </div>
@@ -1347,16 +1444,17 @@ function LanguageBridgeWithVideo() {
                 <div style={{ display: 'flex', gap: '15px', flexWrap: 'wrap' }}>
                   <button
                     onClick={isListening ? stopListening : startListening}
+                    disabled={getOtherUsers().length === 0}
                     style={{
                       padding: '12px 24px',
                       borderRadius: '12px',
                       border: 'none',
-                      background: isListening 
-                        ? 'linear-gradient(135deg, #ef4444, #dc2626)' 
-                        : 'linear-gradient(135deg, #10b981, #047857)',
+                      background: getOtherUsers().length === 0 ? '#d1d5db' :
+                                  isListening ? 'linear-gradient(135deg, #ef4444, #dc2626)' 
+                                              : 'linear-gradient(135deg, #10b981, #047857)',
                       color: 'white',
                       fontWeight: 'bold',
-                      cursor: 'pointer',
+                      cursor: getOtherUsers().length === 0 ? 'not-allowed' : 'pointer',
                       fontSize: '16px',
                       transition: 'all 0.2s'
                     }}
@@ -1393,7 +1491,7 @@ function LanguageBridgeWithVideo() {
                       transition: 'all 0.2s'
                     }}
                   >
-                    {isMuted ? '🔇' : '🔊'}
+                    {isMuted ? '🔇 Muted' : '🔊 Audio On'}
                   </button>
                   
                   <label style={{
@@ -1402,9 +1500,10 @@ function LanguageBridgeWithVideo() {
                     gap: '8px',
                     cursor: 'pointer',
                     padding: '12px 16px',
-                    background: '#f3f4f6',
+                    background: autoSpeak ? '#dcfce7' : '#f3f4f6',
                     borderRadius: '12px',
-                    fontWeight: 'bold'
+                    fontWeight: 'bold',
+                    color: autoSpeak ? '#166534' : '#6b7280'
                   }}>
                     <input
                       type="checkbox"
@@ -1447,6 +1546,21 @@ function LanguageBridgeWithVideo() {
                   🚪 Leave Session
                 </button>
               </div>
+              
+              {getOtherUsers().length === 0 && (
+                <div style={{
+                  marginTop: '15px',
+                  padding: '10px',
+                  background: '#fef3c7',
+                  borderRadius: '8px',
+                  color: '#92400e',
+                  textAlign: 'center',
+                  fontSize: '14px',
+                  fontWeight: 'bold'
+                }}>
+                  ⏳ Waiting for other users to join for translation...
+                </div>
+              )}
             </div>
 
             {/* Communication Interface */}
@@ -1498,7 +1612,9 @@ function LanguageBridgeWithVideo() {
                     <span style={{ color: '#94a3b8', fontStyle: 'italic' }}>
                       {isListening 
                         ? `🎤 Listening... Speak in ${languages.find(l => l.code === userLanguage)?.native}` 
-                        : 'Click "Start Listening" to begin speaking...'}
+                        : getOtherUsers().length > 0 
+                          ? 'Click "Start Listening" to begin speaking...'
+                          : 'Waiting for other users to join...'}
                     </span>
                   )}
                 </div>
@@ -1712,15 +1828,21 @@ function LanguageBridgeWithVideo() {
                       <div style={{ marginBottom: '8px', fontSize: '15px' }}>
                         "{msg.originalText}"
                       </div>
-                      <div style={{
-                        fontSize: '13px',
-                        color: '#6b7280',
-                        fontStyle: 'italic',
-                        paddingTop: '8px',
-                        borderTop: '1px solid #e5e7eb'
-                      }}>
-                        🔄 "{msg.translatedText}"
-                      </div>
+                      {msg.translatedTexts && (
+                        <div style={{
+                          fontSize: '13px',
+                          color: '#6b7280',
+                          fontStyle: 'italic',
+                          paddingTop: '8px',
+                          borderTop: '1px solid #e5e7eb'
+                        }}>
+                          {Object.entries(msg.translatedTexts).map(([lang, translation]) => (
+                            <div key={lang}>
+                              🔄 {languages.find(l => l.code === lang)?.flag} "{translation}"
+                            </div>
+                          ))}
+                        </div>
+                      )}
                     </div>
                   ))}
                 </div>
