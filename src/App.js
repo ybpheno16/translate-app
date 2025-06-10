@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { initializeApp } from 'firebase/app';
-import { getDatabase, ref, push, set, onValue, off, update, remove, serverTimestamp } from 'firebase/database';
+import { getDatabase, ref, push, set, onValue, update, remove, serverTimestamp } from 'firebase/database';
 
 // Firebase configuration
 const firebaseConfig = {
