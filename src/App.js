@@ -67,8 +67,9 @@ function LanguageBridgeWithVideo() {
   const unsubscribersRef = useRef([]);
   const peerConnectionRef = useRef(null);
   const processedMessageIds = useRef(new Set());
-  const iceCandidatesBuffer = useRef([]);
+  const processedSignalingIds = useRef(new Set());
   const audioContextRef = useRef(null);
+  const remoteUserId = useRef(null);
 
   // Languages with better organization (memoized to prevent re-renders)
   const languages = useMemo(() => [
@@ -226,33 +227,35 @@ function LanguageBridgeWithVideo() {
     }
   }, [isVideoEnabled, isAudioEnabled, isMobile, initializeAudioContext]);
 
-  // Send WebRTC signaling data through Firebase
-  const sendSignalingData = useCallback(async (data) => {
+  // Send WebRTC signaling data through Firebase with unique IDs
+  const sendSignalingData = useCallback(async (data, targetUserId = null) => {
     if (!currentSessionCode) return;
     
     try {
       const signalingData = {
+        id: `signal_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
         senderId: userId,
         senderName: userName,
-        targetId: data.targetId || 'broadcast',
+        targetId: targetUserId || 'all',
         data: data,
         timestamp: serverTimestamp()
       };
       
       await push(ref(database, `sessions/${currentSessionCode}/signaling`), signalingData);
-      console.log('📡 Signaling data sent:', data.type, 'to:', data.targetId || 'broadcast');
+      console.log('📡 Signaling sent:', data.type, 'to:', targetUserId || 'all');
     } catch (error) {
       console.error('❌ Failed to send signaling data:', error);
     }
   }, [currentSessionCode, userId, userName]);
 
-  // Enhanced WebRTC setup with better mobile support
-  const setupPeerConnection = useCallback(async (stream, targetUserId = null) => {
+  // Enhanced WebRTC setup with better connection handling
+  const setupPeerConnection = useCallback(async (stream) => {
+    // Close existing connection
     if (peerConnectionRef.current) {
       peerConnectionRef.current.close();
+      console.log('🔄 Closed existing peer connection');
     }
 
-    // Enhanced STUN/TURN configuration for better connectivity
     const configuration = {
       iceServers: [
         { urls: 'stun:stun.l.google.com:19302' },
@@ -261,9 +264,7 @@ function LanguageBridgeWithVideo() {
         { urls: 'stun:stun3.l.google.com:19302' },
         { urls: 'stun:stun4.l.google.com:19302' }
       ],
-      iceCandidatePoolSize: 10,
-      bundlePolicy: 'max-bundle',
-      rtcpMuxPolicy: 'require'
+      iceCandidatePoolSize: 10
     };
     
     const pc = new RTCPeerConnection(configuration);
@@ -271,117 +272,109 @@ function LanguageBridgeWithVideo() {
     setPeerConnection(pc);
     setConnectionState('connecting');
     
-    // Add local stream tracks
+    console.log('🔗 Created new peer connection');
+    
+    // Add local stream tracks first
     if (stream) {
       stream.getTracks().forEach(track => {
-        pc.addTrack(track, stream);
-        console.log('➕ Added track to peer connection:', track.kind, track.enabled);
+        const sender = pc.addTrack(track, stream);
+        console.log('➕ Added local track:', track.kind, track.id);
       });
     }
     
     // Handle remote stream
     pc.ontrack = (event) => {
-      console.log('📹 Received remote track:', event.track.kind);
-      const [remoteStream] = event.streams;
-      setRemoteStream(remoteStream);
+      console.log('📹 Received remote track:', event.track.kind, event.track.id);
+      const [stream] = event.streams;
+      console.log('📺 Setting remote stream with', stream.getTracks().length, 'tracks');
+      
+      setRemoteStream(stream);
       
       if (remoteVideoRef.current) {
-        remoteVideoRef.current.srcObject = remoteStream;
+        remoteVideoRef.current.srcObject = stream;
         
         // Ensure remote video plays on mobile
         if (isMobile) {
           remoteVideoRef.current.setAttribute('playsinline', true);
           remoteVideoRef.current.setAttribute('autoplay', true);
           
-          // Force play on mobile
+          // Force play
           setTimeout(() => {
             if (remoteVideoRef.current) {
               remoteVideoRef.current.play().catch(e => {
-                console.log('Remote video autoplay blocked, user interaction required');
+                console.log('📹 Remote video autoplay blocked:', e.message);
               });
             }
           }, 100);
         }
       }
       
-      setVideoStatus('📹 Remote video connected');
+      setVideoStatus('✅ Remote video connected');
       setConnectionState('connected');
     };
     
-    // Handle ICE candidates with buffering
+    // Handle ICE candidates
     pc.onicecandidate = (event) => {
       if (event.candidate) {
-        console.log('🧊 ICE candidate generated:', event.candidate.type);
+        console.log('🧊 Sending ICE candidate:', event.candidate.type);
         sendSignalingData({
           type: 'ice-candidate',
-          candidate: event.candidate,
-          targetId: targetUserId
-        });
+          candidate: event.candidate
+        }, remoteUserId.current);
       } else {
         console.log('🧊 ICE gathering complete');
       }
     };
 
-    // Enhanced connection state handling
+    // Connection state monitoring
     pc.onconnectionstatechange = () => {
       const state = pc.connectionState;
-      console.log('🔗 Connection state changed:', state);
+      console.log('🔗 Connection state:', state);
       setConnectionState(state);
       
       if (state === 'connected') {
         setVideoStatus('✅ Video call connected');
         setError('');
       } else if (state === 'disconnected') {
-        setVideoStatus('⚠️ Connection lost, reconnecting...');
-        // Attempt to reconnect
-        setTimeout(() => {
-          if (pc.connectionState === 'disconnected') {
-            console.log('🔄 Attempting to reconnect...');
-            createOffer(targetUserId);
-          }
-        }, 3000);
+        setVideoStatus('⚠️ Connection lost');
       } else if (state === 'failed') {
         setVideoStatus('❌ Connection failed');
-        setError('Video connection failed. Please try again.');
-        // Restart connection
+        setError('Video connection failed. Retrying...');
+        
+        // Retry connection
         setTimeout(() => {
-          if (isVideoEnabled) {
-            setupPeerConnection(stream, targetUserId);
+          if (isVideoEnabled && localStream) {
+            console.log('🔄 Retrying video connection...');
+            setupPeerConnection(localStream);
           }
-        }, 5000);
+        }, 3000);
       } else if (state === 'connecting') {
         setVideoStatus('🔄 Connecting...');
       }
     };
 
     pc.oniceconnectionstatechange = () => {
-      console.log('❄️ ICE connection state:', pc.iceConnectionState);
-      
+      console.log('❄️ ICE state:', pc.iceConnectionState);
       if (pc.iceConnectionState === 'failed') {
-        console.log('❄️ ICE connection failed, restarting...');
+        console.log('❄️ ICE failed, restarting...');
         pc.restartIce();
       }
     };
-
-    // Handle buffered ICE candidates
-    iceCandidatesBuffer.current.forEach(candidate => {
-      pc.addIceCandidate(candidate).catch(e => {
-        console.error('❌ Error adding buffered ICE candidate:', e);
-      });
-    });
-    iceCandidatesBuffer.current = [];
     
     return pc;
-  }, [sendSignalingData, isVideoEnabled, isMobile]);
+  }, [sendSignalingData, isVideoEnabled, localStream, isMobile]);
 
-  // Create offer for video call
-  const createOffer = useCallback(async (targetUserId = null) => {
+  // Create and send offer
+  const createOffer = useCallback(async () => {
     const pc = peerConnectionRef.current;
-    if (!pc) return;
+    if (!pc) {
+      console.error('❌ No peer connection for offer');
+      return;
+    }
 
     try {
-      console.log('📞 Creating offer for:', targetUserId || 'broadcast');
-      setVideoStatus('📞 Creating call offer...');
+      console.log('📞 Creating offer...');
+      setVideoStatus('📞 Creating offer...');
       
       const offer = await pc.createOffer({
         offerToReceiveVideo: true,
@@ -389,81 +382,87 @@ function LanguageBridgeWithVideo() {
       });
       
       await pc.setLocalDescription(offer);
+      console.log('📞 Local description set');
       
       await sendSignalingData({
         type: 'offer',
-        offer: offer,
-        targetId: targetUserId
-      });
+        offer: offer
+      }, remoteUserId.current);
       
-      console.log('✅ Offer sent');
-      setVideoStatus('📞 Call offer sent');
+      console.log('✅ Offer sent to:', remoteUserId.current);
+      setVideoStatus('📞 Offer sent, waiting for answer...');
     } catch (error) {
       console.error('❌ Error creating offer:', error);
       setVideoStatus('❌ Failed to create offer');
-      setError('Failed to create video call offer');
     }
   }, [sendSignalingData]);
 
   // Handle received offer
   const handleOffer = useCallback(async (offer, senderId) => {
     const pc = peerConnectionRef.current;
-    if (!pc) return;
+    if (!pc) {
+      console.error('❌ No peer connection for offer handling');
+      return;
+    }
 
     try {
-      console.log('📞 Received offer from:', senderId);
-      setVideoStatus('📞 Received call, answering...');
+      console.log('📞 Handling offer from:', senderId);
+      setVideoStatus('📞 Received offer, creating answer...');
+      
+      remoteUserId.current = senderId;
       
       await pc.setRemoteDescription(new RTCSessionDescription(offer));
+      console.log('📞 Remote description set from offer');
       
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
+      console.log('📞 Local description set from answer');
       
       await sendSignalingData({
         type: 'answer',
-        answer: answer,
-        targetId: senderId
-      });
+        answer: answer
+      }, senderId);
       
       console.log('✅ Answer sent to:', senderId);
-      setVideoStatus('✅ Call answered');
+      setVideoStatus('✅ Answer sent');
     } catch (error) {
       console.error('❌ Error handling offer:', error);
-      setVideoStatus('❌ Failed to answer call');
-      setError('Failed to answer video call');
+      setVideoStatus('❌ Failed to handle offer');
     }
   }, [sendSignalingData]);
 
   // Handle received answer
   const handleAnswer = useCallback(async (answer, senderId) => {
     const pc = peerConnectionRef.current;
-    if (!pc) return;
+    if (!pc) {
+      console.error('❌ No peer connection for answer handling');
+      return;
+    }
 
     try {
-      console.log('✅ Received answer from:', senderId);
+      console.log('✅ Handling answer from:', senderId);
+      
       await pc.setRemoteDescription(new RTCSessionDescription(answer));
-      setVideoStatus('✅ Call established');
+      console.log('✅ Remote description set from answer');
+      
+      setVideoStatus('✅ Connection established');
     } catch (error) {
       console.error('❌ Error handling answer:', error);
-      setVideoStatus('❌ Failed to establish call');
-      setError('Failed to establish video call');
+      setVideoStatus('❌ Failed to handle answer');
     }
   }, []);
 
-  // Handle ICE candidate with improved error handling
+  // Handle ICE candidate
   const handleIceCandidate = useCallback(async (candidate, senderId) => {
     const pc = peerConnectionRef.current;
-    
     if (!pc) {
-      // Buffer ICE candidates if peer connection not ready
-      iceCandidatesBuffer.current.push(candidate);
       console.log('🧊 Buffering ICE candidate from:', senderId);
       return;
     }
 
     try {
       await pc.addIceCandidate(new RTCIceCandidate(candidate));
-      console.log('🧊 ICE candidate added from:', senderId);
+      console.log('🧊 Added ICE candidate from:', senderId);
     } catch (error) {
       console.error('❌ Error adding ICE candidate:', error);
     }
@@ -820,29 +819,50 @@ function LanguageBridgeWithVideo() {
   const setupFirebaseListeners = useCallback((sessionCode) => {
     // Clear processed messages when setting up new listeners
     processedMessageIds.current.clear();
+    processedSignalingIds.current.clear();
     
-    // Listen to users
+    // Listen to users with video call initiation
     const usersRef = ref(database, `sessions/${sessionCode}/users`);
-    const unsubscribeUsers = onValue(usersRef, (snapshot) => {
+    const unsubscribeUsers = onValue(usersRef, async (snapshot) => {
       const users = snapshot.val() || {};
       setConnectedUsers(users);
-      console.log('👥 Users updated:', Object.keys(users).length, 'users connected');
       
-      // Enhanced video call initiation
-      const otherUsers = Object.values(users).filter(u => u.id !== userId && u.hasVideo && u.isOnline);
-      if (otherUsers.length > 0 && isVideoEnabled && peerConnectionRef.current) {
-        // More sophisticated call initiation based on user ID comparison
-        const shouldInitiate = userId > otherUsers[0].id; // Consistent ordering
-        if (shouldInitiate && !isCallInitiator) {
-          console.log('🚀 Initiating video call to:', otherUsers[0].name);
-          setIsCallInitiator(true);
-          setTimeout(() => createOffer(otherUsers[0].id), 2000);
+      const userCount = Object.keys(users).length;
+      const onlineUsers = Object.values(users).filter(u => u.isOnline);
+      const videoUsers = onlineUsers.filter(u => u.hasVideo);
+      
+      console.log('👥 Users updated:', userCount, 'total,', onlineUsers.length, 'online,', videoUsers.length, 'with video');
+      
+      // Video call logic - improved
+      if (isVideoEnabled && peerConnectionRef.current) {
+        const otherVideoUsers = videoUsers.filter(u => u.id !== userId);
+        
+        if (otherVideoUsers.length > 0 && !isCallInitiator) {
+          const targetUser = otherVideoUsers[0];
+          remoteUserId.current = targetUser.id;
+          
+          // Determine who should initiate based on user ID (alphabetical order for consistency)
+          const shouldInitiate = userId < targetUser.id;
+          
+          if (shouldInitiate) {
+            console.log('🚀 Initiating video call to:', targetUser.name, '(ID:', targetUser.id, ')');
+            setIsCallInitiator(true);
+            setVideoStatus('🚀 Initiating video call...');
+            
+            // Wait a moment for peer connection to be fully ready
+            setTimeout(() => {
+              createOffer();
+            }, 1500);
+          } else {
+            console.log('⏳ Waiting for video call from:', targetUser.name, '(ID:', targetUser.id, ')');
+            setVideoStatus('⏳ Waiting for incoming call...');
+          }
         }
       }
     });
     unsubscribersRef.current.push(unsubscribeUsers);
     
-    // Listen to messages with real-time processing
+    // Listen to messages
     const messagesRef = ref(database, `sessions/${sessionCode}/messages`);
     const unsubscribeMessages = onValue(messagesRef, (snapshot) => {
       const messagesData = snapshot.val() || {};
@@ -858,18 +878,23 @@ function LanguageBridgeWithVideo() {
     });
     unsubscribersRef.current.push(unsubscribeMessages);
     
-    // Enhanced WebRTC signaling listener
+    // Enhanced signaling listener with duplicate prevention
     const signalingRef = ref(database, `sessions/${sessionCode}/signaling`);
     const unsubscribeSignaling = onValue(signalingRef, (snapshot) => {
       const signalingData = snapshot.val() || {};
       const signalingList = Object.values(signalingData)
-        .filter(signal => signal.senderId !== userId) // Only process signals from other users
-        .filter(signal => !signal.targetId || signal.targetId === 'broadcast' || signal.targetId === userId) // Only for me
+        .filter(signal => signal.senderId !== userId) // Only from other users
+        .filter(signal => signal.targetId === 'all' || signal.targetId === userId) // For me
+        .filter(signal => !processedSignalingIds.current.has(signal.id)) // Not already processed
         .sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
       
-      // Process signaling data
+      console.log('📡 Processing', signalingList.length, 'new signaling messages');
+      
+      // Process each signaling message
       signalingList.forEach(signal => {
+        processedSignalingIds.current.add(signal.id);
         const { data, senderId } = signal;
+        
         console.log('📡 Processing signaling:', data.type, 'from:', senderId);
         
         if (data.type === 'offer') {
@@ -915,7 +940,8 @@ function LanguageBridgeWithVideo() {
       setIsCallInitiator(false);
       lastTranscriptRef.current = '';
       processedMessageIds.current.clear();
-      iceCandidatesBuffer.current = [];
+      processedSignalingIds.current.clear();
+      remoteUserId.current = null;
       
       // Add user to Firebase session
       const userData = {
@@ -935,10 +961,10 @@ function LanguageBridgeWithVideo() {
       
       await set(ref(database, `sessions/${newCode}/users/${userId}`), userData);
       
-      // Setup video if enabled
+      // Setup peer connection if video enabled
       if (isVideoEnabled && stream) {
         await setupPeerConnection(stream);
-        setVideoStatus('📹 Waiting for other users...');
+        setVideoStatus('📹 Ready for video calls...');
       }
       
       // Setup Firebase listeners
@@ -985,7 +1011,8 @@ function LanguageBridgeWithVideo() {
       setIsCallInitiator(false);
       lastTranscriptRef.current = '';
       processedMessageIds.current.clear();
-      iceCandidatesBuffer.current = [];
+      processedSignalingIds.current.clear();
+      remoteUserId.current = null;
       
       // Add user to Firebase session
       const userData = {
@@ -1005,10 +1032,10 @@ function LanguageBridgeWithVideo() {
       
       await set(ref(database, `sessions/${sessionCode}/users/${userId}`), userData);
       
-      // Setup video if enabled
+      // Setup peer connection if video enabled
       if (isVideoEnabled && stream) {
         await setupPeerConnection(stream);
-        setVideoStatus('📹 Joining video call...');
+        setVideoStatus('📹 Ready for video calls...');
       }
       
       // Setup Firebase listeners
@@ -1062,10 +1089,9 @@ function LanguageBridgeWithVideo() {
     console.log('🛑 Stopped speech recognition');
   }, []);
 
-  // Enhanced toggle video with mobile support
+  // Enhanced toggle video with better connection handling
   const toggleVideo = useCallback(async () => {
     if (!isVideoEnabled) {
-      // Turn on video
       try {
         const stream = await initializeMedia();
         if (!stream) return;
@@ -1081,16 +1107,8 @@ function LanguageBridgeWithVideo() {
 
         // Setup peer connection if connected
         if (isConnected) {
-          const otherUsers = getOtherUsers();
-          if (otherUsers.length > 0) {
-            await setupPeerConnection(stream, otherUsers[0].id);
-            setVideoStatus('📹 Video enabled, connecting...');
-            
-            // Initiate call if appropriate
-            if (userId > otherUsers[0].id) {
-              setTimeout(() => createOffer(otherUsers[0].id), 1000);
-            }
-          }
+          await setupPeerConnection(stream);
+          setVideoStatus('📹 Video enabled, ready for calls...');
         }
       } catch (error) {
         setError('Failed to enable video: ' + error.message);
@@ -1109,6 +1127,8 @@ function LanguageBridgeWithVideo() {
       setRemoteStream(null);
       setVideoStatus('');
       setConnectionState('new');
+      setIsCallInitiator(false);
+      remoteUserId.current = null;
       
       // Update in Firebase
       if (currentSessionCode) {
@@ -1117,7 +1137,7 @@ function LanguageBridgeWithVideo() {
         });
       }
     }
-  }, [isVideoEnabled, initializeMedia, currentSessionCode, userId, isConnected, getOtherUsers, setupPeerConnection, createOffer, localStream]);
+  }, [isVideoEnabled, initializeMedia, currentSessionCode, userId, isConnected, setupPeerConnection, localStream]);
 
   // Leave session with complete cleanup
   const leaveSession = useCallback(() => {
@@ -1168,7 +1188,8 @@ function LanguageBridgeWithVideo() {
     setConnectionState('new');
     lastTranscriptRef.current = '';
     processedMessageIds.current.clear();
-    iceCandidatesBuffer.current = [];
+    processedSignalingIds.current.clear();
+    remoteUserId.current = null;
   }, [localStream, remoteStream, stopListening, currentSessionCode, userId]);
 
   // Clear transcripts
@@ -1381,8 +1402,8 @@ function LanguageBridgeWithVideo() {
             <div style={{
               padding: '8px 16px',
               borderRadius: '20px',
-              background: '#f0f9ff',
-              color: '#1e40af',
+              background: connectionState === 'connected' ? '#dcfce7' : '#f0f9ff',
+              color: connectionState === 'connected' ? '#166534' : '#1e40af',
               fontWeight: 'bold',
               fontSize: isMobile ? '12px' : '14px',
               maxWidth: isMobile ? '200px' : 'none',
@@ -1664,7 +1685,7 @@ function LanguageBridgeWithVideo() {
                 marginBottom: '20px'
               }}>
                 <h3 style={{ margin: '0 0 15px 0', textAlign: 'center', fontSize: isMobile ? '1.1rem' : '1.3rem' }}>
-                  📹 Video Chat {connectionState && `(${connectionState})`}
+                  📹 Video Chat {connectionState !== 'new' && `(${connectionState})`}
                 </h3>
                 <div style={{
                   display: 'grid',
@@ -1759,7 +1780,8 @@ function LanguageBridgeWithVideo() {
                         <div style={{ fontSize: isMobile ? '36px' : '48px', marginBottom: '10px' }}>👤</div>
                         <div style={{ fontSize: isMobile ? '14px' : '16px' }}>
                           {getOtherUsers().some(u => u.hasVideo) 
-                            ? (isMobile ? 'Tap to play when connected' : 'Connecting to remote video...') 
+                            ? (connectionState === 'connecting' ? 'Connecting to remote video...' : 
+                               isMobile ? 'Tap to play when connected' : 'Waiting for video connection...') 
                             : 'Waiting for other users to enable video...'}
                         </div>
                       </div>
