@@ -1,36 +1,8 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 
-// Mock Firebase functions for demo - replace with actual Firebase imports in production
-const mockFirebase = {
-  initializeApp: () => ({}),
-  getDatabase: () => ({}),
-  ref: (db, path) => ({ db, path }),
-  push: async (ref, data) => {
-    console.log('Firebase push:', ref.path, data);
-    return Promise.resolve({ key: 'mock-key' });
-  },
-  set: async (ref, data) => {
-    console.log('Firebase set:', ref.path, data);
-    return Promise.resolve();
-  },
-  onValue: (ref, callback) => {
-    console.log('Firebase onValue listener for:', ref.path);
-    // Return unsubscribe function
-    return () => console.log('Unsubscribed from:', ref.path);
-  },
-  update: async (ref, data) => {
-    console.log('Firebase update:', ref.path, data);
-    return Promise.resolve();
-  },
-  remove: async (ref) => {
-    console.log('Firebase remove:', ref.path);
-    return Promise.resolve();
-  },
-  serverTimestamp: () => Date.now()
-};
-
-// Use mock functions - replace these with actual Firebase imports
-const { initializeApp, getDatabase, ref, push, set, onValue, update, remove, serverTimestamp } = mockFirebase;
+// Real Firebase imports - install firebase package: npm install firebase
+import { initializeApp } from 'firebase/app';
+import { getDatabase, ref, push, set, onValue, update, remove, serverTimestamp } from 'firebase/database';
 
 // Firebase configuration
 const firebaseConfig = {
@@ -1244,20 +1216,6 @@ function PremiumLanguageBridge() {
           }}>
             Real-time voice translation with video chat
           </p>
-          <div style={{
-            marginTop: '16px',
-            padding: '12px 20px',
-            background: '#fef3c7',
-            border: '1px solid #fbbf24',
-            borderRadius: '12px',
-            color: '#92400e',
-            fontSize: '14px',
-            fontWeight: '500',
-            maxWidth: '600px',
-            margin: '16px auto 0 auto'
-          }}>
-            🚧 Demo with Mock Firebase - Replace mockFirebase with actual Firebase imports for production use
-          </div>
         </div>
 
         {/* Status Bar */}
