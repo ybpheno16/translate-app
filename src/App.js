@@ -1,6 +1,24 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getDatabase, ref, push, set, onValue, update, remove, serverTimestamp } from 'firebase/database';
 
-function PremiumLanguageBridge() {
+// Firebase configuration
+const firebaseConfig = {
+  apiKey: "AIzaSyDVXUVwiel_rb1Z7T4xFktArycVvjc1Nfs",
+  authDomain: "voicetranslate-e446d.firebaseapp.com",
+  databaseURL: "https://voicetranslate-e446d-default-rtdb.firebaseio.com",
+  projectId: "voicetranslate-e446d",
+  storageBucket: "voicetranslate-e446d.firebasestorage.app",
+  messagingSenderId: "672126549267",
+  appId: "1:672126549267:web:ebd535ac880aead5242ee6",
+  measurementId: "G-L8DTTXJGJN"
+};
+
+// Initialize Firebase
+const app = initializeApp(firebaseConfig);
+const database = getDatabase(app);
+
+function LanguageBridgeWithVideo() {
   // User state
   const [userId] = useState(() => `user_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`);
   const [userName, setUserName] = useState('');
@@ -17,9 +35,9 @@ function PremiumLanguageBridge() {
   const [isVideoEnabled, setIsVideoEnabled] = useState(false);
   const [isAudioEnabled, setIsAudioEnabled] = useState(true);
   
-  // Demo state for UI showcase
-  const [connectedUsers, setConnectedUsers] = useState({});
+  // Messages and users
   const [messages, setMessages] = useState([]);
+  const [connectedUsers, setConnectedUsers] = useState({});
   const [myTranscript, setMyTranscript] = useState('');
   const [receivedTranscript, setReceivedTranscript] = useState('');
   
@@ -28,10 +46,12 @@ function PremiumLanguageBridge() {
   const [error, setError] = useState('');
   const [videoStatus, setVideoStatus] = useState('');
   const [translationStatus, setTranslationStatus] = useState('');
+  const [permissionStatus, setPermissionStatus] = useState('');
   
   // Video state
   const [localStream, setLocalStream] = useState(null);
   const [remoteStream, setRemoteStream] = useState(null);
+  const [peerConnection, setPeerConnection] = useState(null);
   const [connectionState, setConnectionState] = useState('new');
   
   // Mobile detection
@@ -43,7 +63,13 @@ function PremiumLanguageBridge() {
   const localVideoRef = useRef(null);
   const remoteVideoRef = useRef(null);
   const lastTranscriptRef = useRef('');
+  const unsubscribersRef = useRef([]);
+  const peerConnectionRef = useRef(null);
+  const processedMessageIds = useRef(new Set());
+  const processedSignalingIds = useRef(new Set());
   const audioContextRef = useRef(null);
+  const pendingIceCandidates = useRef([]);
+  const callInProgress = useRef(false);
 
   // Languages
   const languages = useMemo(() => [
@@ -78,7 +104,7 @@ function PremiumLanguageBridge() {
     setIsMobile(mobile);
     setIsIOS(ios);
     
-    console.log('Device detection:', { mobile, ios, userId });
+    console.log('📱 Device detection:', { mobile, ios, userId });
   }, [userId]);
 
   // Get other users who are online
@@ -91,15 +117,15 @@ function PremiumLanguageBridge() {
     if (!audioContextRef.current && (window.AudioContext || window.webkitAudioContext)) {
       try {
         audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)();
-        console.log('Audio context initialized');
+        console.log('🎵 Audio context initialized');
         
         if (audioContextRef.current.state === 'suspended') {
           audioContextRef.current.resume().then(() => {
-            console.log('Audio context resumed');
+            console.log('🎵 Audio context resumed');
           });
         }
       } catch (error) {
-        console.error('Audio context initialization failed:', error);
+        console.error('❌ Audio context initialization failed:', error);
       }
     }
   }, []);
@@ -107,7 +133,8 @@ function PremiumLanguageBridge() {
   // Enhanced media initialization
   const initializeMedia = useCallback(async () => {
     try {
-      setVideoStatus('Requesting permissions...');
+      setVideoStatus('🎥 Requesting permissions...');
+      setPermissionStatus('📋 Checking permissions...');
       
       initializeAudioContext();
       
@@ -127,7 +154,7 @@ function PremiumLanguageBridge() {
         } : false
       };
       
-      console.log('Requesting media with constraints:', constraints);
+      console.log('📱 Requesting media with constraints:', constraints);
       
       const stream = await navigator.mediaDevices.getUserMedia(constraints);
       
@@ -141,8 +168,9 @@ function PremiumLanguageBridge() {
         }
       }
       
-      setVideoStatus('Media ready');
-      console.log('Media initialized successfully:', { 
+      setVideoStatus('✅ Media ready');
+      setPermissionStatus('✅ Permissions granted');
+      console.log('✅ Media initialized successfully:', { 
         video: isVideoEnabled, 
         audio: isAudioEnabled,
         tracks: stream.getTracks().length
@@ -150,23 +178,272 @@ function PremiumLanguageBridge() {
       
       return stream;
     } catch (error) {
-      console.error('Media access error:', error);
+      console.error('❌ Media access error:', error);
       const errorMessage = `Media access failed: ${error.message}${isMobile ? ' (Mobile: Ensure HTTPS and permissions)' : ''}`;
       setError(errorMessage);
-      setVideoStatus('Media failed');
+      setVideoStatus('❌ Media failed');
+      setPermissionStatus('❌ Access denied');
       return null;
     }
   }, [isVideoEnabled, isAudioEnabled, isMobile, initializeAudioContext]);
 
+  // Send signaling data with room-based targeting
+  const sendSignalingData = useCallback(async (data) => {
+    if (!currentSessionCode) return;
+    
+    try {
+      const signalingMessage = {
+        id: `${userId}_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
+        senderId: userId,
+        senderName: userName,
+        data: data,
+        timestamp: Date.now()
+      };
+      
+      await push(ref(database, `sessions/${currentSessionCode}/webrtc`), signalingMessage);
+      console.log('📡 Sent signaling:', data.type, 'ID:', signalingMessage.id);
+    } catch (error) {
+      console.error('❌ Failed to send signaling:', error);
+    }
+  }, [currentSessionCode, userId, userName]);
+
+  // Setup peer connection with enhanced handling
+  const setupPeerConnection = useCallback(async (stream) => {
+    console.log('🔗 Setting up peer connection...');
+    
+    // Close existing connection
+    if (peerConnectionRef.current) {
+      peerConnectionRef.current.close();
+      console.log('🔄 Closed existing peer connection');
+    }
+
+    const configuration = {
+      iceServers: [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' },
+        { urls: 'stun:stun2.l.google.com:19302' }
+      ],
+      iceCandidatePoolSize: 10
+    };
+    
+    const pc = new RTCPeerConnection(configuration);
+    peerConnectionRef.current = pc;
+    setPeerConnection(pc);
+    setConnectionState('connecting');
+    
+    // Add local stream tracks
+    if (stream) {
+      stream.getTracks().forEach(track => {
+        pc.addTrack(track, stream);
+        console.log('➕ Added local track:', track.kind);
+      });
+    }
+    
+    // Handle remote stream
+    pc.ontrack = (event) => {
+      console.log('📹 Received remote track:', event.track.kind);
+      const [remoteStream] = event.streams;
+      console.log('📺 Remote stream received with', remoteStream.getTracks().length, 'tracks');
+      
+      setRemoteStream(remoteStream);
+      
+      if (remoteVideoRef.current && remoteStream) {
+        remoteVideoRef.current.srcObject = remoteStream;
+        
+        if (isMobile) {
+          remoteVideoRef.current.setAttribute('playsinline', true);
+          remoteVideoRef.current.setAttribute('autoplay', true);
+          
+          setTimeout(() => {
+            if (remoteVideoRef.current) {
+              remoteVideoRef.current.play().catch(e => {
+                console.log('📹 Remote video autoplay blocked:', e.message);
+              });
+            }
+          }, 500);
+        }
+      }
+      
+      setVideoStatus('✅ Remote video connected');
+      setConnectionState('connected');
+    };
+    
+    // Handle ICE candidates
+    pc.onicecandidate = (event) => {
+      if (event.candidate) {
+        console.log('🧊 Generated ICE candidate:', event.candidate.type);
+        sendSignalingData({
+          type: 'ice-candidate',
+          candidate: event.candidate
+        });
+      } else {
+        console.log('🧊 ICE gathering complete');
+      }
+    };
+
+    // Connection state monitoring
+    pc.onconnectionstatechange = () => {
+      const state = pc.connectionState;
+      console.log('🔗 Connection state changed to:', state);
+      setConnectionState(state);
+      
+      if (state === 'connected') {
+        setVideoStatus('✅ Video call connected');
+        callInProgress.current = true;
+        setError('');
+      } else if (state === 'disconnected') {
+        setVideoStatus('⚠️ Connection lost');
+        callInProgress.current = false;
+      } else if (state === 'failed') {
+        setVideoStatus('❌ Connection failed');
+        callInProgress.current = false;
+        // Retry after delay
+        setTimeout(() => {
+          if (isVideoEnabled && localStream) {
+            console.log('🔄 Retrying connection...');
+            initiateCall();
+          }
+        }, 3000);
+      }
+    };
+
+    pc.oniceconnectionstatechange = () => {
+      console.log('❄️ ICE connection state:', pc.iceConnectionState);
+    };
+
+    // Process any pending ICE candidates
+    pendingIceCandidates.current.forEach(candidate => {
+      pc.addIceCandidate(candidate).catch(e => {
+        console.error('❌ Error adding pending ICE candidate:', e);
+      });
+    });
+    pendingIceCandidates.current = [];
+    
+    return pc;
+  }, [sendSignalingData, isVideoEnabled, localStream, isMobile]);
+
+  // Initiate video call
+  const initiateCall = useCallback(async () => {
+    if (callInProgress.current) {
+      console.log('📞 Call already in progress, skipping...');
+      return;
+    }
+
+    const pc = peerConnectionRef.current;
+    if (!pc) {
+      console.error('❌ No peer connection available for call');
+      return;
+    }
+
+    try {
+      console.log('📞 Creating offer...');
+      setVideoStatus('📞 Creating offer...');
+      callInProgress.current = true;
+      
+      const offer = await pc.createOffer({
+        offerToReceiveVideo: true,
+        offerToReceiveAudio: true
+      });
+      
+      await pc.setLocalDescription(offer);
+      console.log('📞 Local description set, sending offer...');
+      
+      await sendSignalingData({
+        type: 'offer',
+        offer: offer
+      });
+      
+      console.log('✅ Offer sent successfully');
+      setVideoStatus('📞 Offer sent, waiting for answer...');
+    } catch (error) {
+      console.error('❌ Error creating offer:', error);
+      setVideoStatus('❌ Failed to create offer');
+      callInProgress.current = false;
+    }
+  }, [sendSignalingData]);
+
+  // Handle received offer
+  const handleOffer = useCallback(async (offer, senderId) => {
+    console.log('📞 Handling offer from:', senderId);
+    
+    const pc = peerConnectionRef.current;
+    if (!pc) {
+      console.error('❌ No peer connection for offer');
+      return;
+    }
+
+    try {
+      setVideoStatus('📞 Processing offer...');
+      
+      await pc.setRemoteDescription(new RTCSessionDescription(offer));
+      console.log('📞 Remote description set from offer');
+      
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      console.log('📞 Answer created and local description set');
+      
+      await sendSignalingData({
+        type: 'answer',
+        answer: answer
+      });
+      
+      console.log('✅ Answer sent to:', senderId);
+      setVideoStatus('✅ Answer sent');
+      callInProgress.current = true;
+    } catch (error) {
+      console.error('❌ Error handling offer:', error);
+      setVideoStatus('❌ Failed to handle offer');
+    }
+  }, [sendSignalingData]);
+
+  // Handle received answer
+  const handleAnswer = useCallback(async (answer, senderId) => {
+    console.log('✅ Handling answer from:', senderId);
+    
+    const pc = peerConnectionRef.current;
+    if (!pc) {
+      console.error('❌ No peer connection for answer');
+      return;
+    }
+
+    try {
+      await pc.setRemoteDescription(new RTCSessionDescription(answer));
+      console.log('✅ Remote description set from answer');
+      setVideoStatus('✅ Call established');
+    } catch (error) {
+      console.error('❌ Error handling answer:', error);
+      setVideoStatus('❌ Failed to handle answer');
+    }
+  }, []);
+
+  // Handle ICE candidate
+  const handleIceCandidate = useCallback(async (candidate, senderId) => {
+    console.log('🧊 Handling ICE candidate from:', senderId);
+    
+    const pc = peerConnectionRef.current;
+    if (!pc || pc.remoteDescription === null) {
+      console.log('🧊 Buffering ICE candidate (no remote description yet)');
+      pendingIceCandidates.current.push(candidate);
+      return;
+    }
+
+    try {
+      await pc.addIceCandidate(new RTCIceCandidate(candidate));
+      console.log('🧊 ICE candidate added successfully');
+    } catch (error) {
+      console.error('❌ Error adding ICE candidate:', error);
+    }
+  }, []);
+
   // Generate session code
   const generateCode = () => Math.random().toString(36).substring(2, 8).toUpperCase();
 
-  // Translation function (demo version)
+  // Translation function
   const translateText = useCallback(async (text, fromLang, toLang) => {
     if (!text.trim() || !apiKey || fromLang === toLang) return text;
     
     try {
-      setTranslationStatus('Translating...');
+      setTranslationStatus('🤖 Translating...');
       const fromLangInfo = languages.find(l => l.code === fromLang);
       const toLangInfo = languages.find(l => l.code === toLang);
       
@@ -205,14 +482,14 @@ function PremiumLanguageBridge() {
       
       translation = translation.replace(/^["']|["']$/g, '');
       
-      setTranslationStatus('Translation complete');
+      setTranslationStatus('✅ Translation complete');
       setTimeout(() => setTranslationStatus(''), 2000);
       
-      console.log('Translation:', { from: text, to: translation, fromLang, toLang });
+      console.log('✅ Translation:', { from: text, to: translation, fromLang, toLang });
       return translation;
     } catch (error) {
-      console.error('Translation error:', error);
-      setTranslationStatus('Translation failed');
+      console.error('❌ Translation error:', error);
+      setTranslationStatus('❌ Translation failed');
       setTimeout(() => setTranslationStatus(''), 3000);
       return `[Translation Error: ${text}]`;
     }
@@ -222,7 +499,7 @@ function PremiumLanguageBridge() {
   const speakText = useCallback((text, languageCode) => {
     if (!text || isMuted || !window.speechSynthesis) return;
     
-    console.log('Speaking:', { text: text.substring(0, 50), languageCode, isMobile });
+    console.log('🗣️ Speaking:', { text: text.substring(0, 50), languageCode, isMobile });
     
     initializeAudioContext();
     speechSynthesis.cancel();
@@ -253,10 +530,10 @@ function PremiumLanguageBridge() {
       utterance.voice = preferredVoice;
     }
     
-    utterance.onstart = () => console.log('Speech started');
-    utterance.onend = () => console.log('Speech ended');
+    utterance.onstart = () => console.log('🗣️ Speech started');
+    utterance.onend = () => console.log('🗣️ Speech ended');
     utterance.onerror = (event) => {
-      console.error('Speech error:', event);
+      console.error('❌ Speech error:', event);
       if (isMobile && event.error === 'synthesis-failed') {
         setTimeout(() => speechSynthesis.speak(utterance), 1000);
       }
@@ -268,6 +545,29 @@ function PremiumLanguageBridge() {
       speechSynthesis.speak(utterance);
     }
   }, [isMuted, isMobile, isIOS, initializeAudioContext]);
+
+  // Send translation message
+  const sendTranslationMessage = useCallback(async (originalText, translatedTexts) => {
+    if (!currentSessionCode) return;
+
+    const messageData = {
+      messageId: `${userId}_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
+      senderId: userId,
+      senderName: userName,
+      originalText: originalText,
+      originalLang: userLanguage,
+      translatedTexts: translatedTexts,
+      timestamp: Date.now(),
+      type: 'translation'
+    };
+    
+    try {
+      await push(ref(database, `sessions/${currentSessionCode}/messages`), messageData);
+      console.log('✅ Translation message sent:', messageData.messageId);
+    } catch (error) {
+      console.error('❌ Failed to send translation:', error);
+    }
+  }, [currentSessionCode, userId, userName, userLanguage]);
 
   // Enhanced speech recognition
   const setupSpeechRecognition = useCallback(() => {
@@ -288,7 +588,7 @@ function PremiumLanguageBridge() {
       setIsListening(true);
       setStatus('listening');
       setError('');
-      console.log('Speech recognition started for:', userName);
+      console.log('🎤 Speech recognition started for:', userName);
       initializeAudioContext();
     };
 
@@ -314,32 +614,33 @@ function PremiumLanguageBridge() {
         lastTranscriptRef.current += cleanText + ' ';
         setMyTranscript(lastTranscriptRef.current);
         
-        console.log('Final transcript from', userName + ':', cleanText);
+        console.log('🗣️ Final transcript from', userName + ':', cleanText);
         
         const otherUsers = getOtherUsers();
-        console.log('Other users for translation:', otherUsers.map(u => u.name));
+        console.log('👥 Other users for translation:', otherUsers.map(u => u.name));
         
         if (otherUsers.length > 0) {
           setStatus('translating');
           
-          // Demo: simulate translation for other users
+          const translatedTexts = {};
+          
+          // Translate for each other user's language
           for (const user of otherUsers) {
             if (user.language !== userLanguage) {
               try {
                 const translation = await translateText(cleanText, userLanguage, user.language);
-                console.log(`Translated for ${user.name} (${user.language}):`, translation);
-                
-                // Demo: show translation in received transcript
-                setTimeout(() => {
-                  setReceivedTranscript(prev => prev + translation + ' ');
-                  if (autoSpeak) {
-                    speakText(translation, userLanguage);
-                  }
-                }, 1000);
+                translatedTexts[user.language] = translation;
+                console.log(`✅ Translated for ${user.name} (${user.language}):`, translation);
               } catch (error) {
-                console.error(`Translation failed for ${user.name}:`, error);
+                console.error(`❌ Translation failed for ${user.name}:`, error);
+                translatedTexts[user.language] = `[Translation Error: ${cleanText}]`;
               }
             }
+          }
+          
+          // Send translations
+          if (Object.keys(translatedTexts).length > 0) {
+            await sendTranslationMessage(cleanText, translatedTexts);
           }
           
           setStatus('online');
@@ -348,7 +649,7 @@ function PremiumLanguageBridge() {
     };
 
     recognition.onerror = (event) => {
-      console.error('Speech recognition error for', userName + ':', event.error);
+      console.error('❌ Speech recognition error for', userName + ':', event.error);
       
       if (event.error === 'no-speech') return;
       
@@ -371,7 +672,7 @@ function PremiumLanguageBridge() {
     };
 
     recognition.onend = () => {
-      console.log('Speech recognition ended for:', userName);
+      console.log('🎤 Speech recognition ended for:', userName);
       setIsListening(false);
       if (isConnected && !error) {
         setStatus('online');
@@ -382,9 +683,9 @@ function PremiumLanguageBridge() {
             if (isConnected && recognitionRef.current === recognition) {
               try {
                 recognition.start();
-                console.log('Speech recognition restarted for:', userName);
+                console.log('🔄 Speech recognition restarted for:', userName);
               } catch (e) {
-                console.log('Recognition restart failed:', e);
+                console.log('❌ Recognition restart failed:', e);
               }
             }
           }, 1000);
@@ -393,12 +694,133 @@ function PremiumLanguageBridge() {
     };
 
     return recognition;
-  }, [userLanguage, userName, getOtherUsers, translateText, isConnected, error, isMobile, initializeAudioContext, autoSpeak, speakText]);
+  }, [userLanguage, userName, getOtherUsers, translateText, sendTranslationMessage, isConnected, error, isMobile, initializeAudioContext]);
 
-  // Create session (demo version)
+  // Handle received messages
+  const handleReceivedMessage = useCallback((message) => {
+    if (message.senderId === userId) return;
+    if (processedMessageIds.current.has(message.messageId)) return;
+    
+    processedMessageIds.current.add(message.messageId);
+    console.log('📨 Processing message from', message.senderName + ':', message.messageId);
+    
+    if (message.type === 'translation') {
+      const translationForMe = message.translatedTexts[userLanguage];
+      
+      if (translationForMe) {
+        console.log('🔄 Translation for me:', translationForMe);
+        
+        setReceivedTranscript(prev => prev + translationForMe + ' ');
+        
+        if (autoSpeak) {
+          setTimeout(() => {
+            speakText(translationForMe, userLanguage);
+          }, 500);
+        }
+        
+        setTranslationStatus(`📨 From: ${message.senderName}`);
+        setTimeout(() => setTranslationStatus(''), 3000);
+      }
+    }
+  }, [userId, userLanguage, autoSpeak, speakText]);
+
+  // Setup Firebase listeners
+  const setupFirebaseListeners = useCallback((sessionCode) => {
+    console.log('🔥 Setting up Firebase listeners for:', sessionCode);
+    
+    processedMessageIds.current.clear();
+    processedSignalingIds.current.clear();
+    
+    // Listen to users
+    const usersRef = ref(database, `sessions/${sessionCode}/users`);
+    const unsubscribeUsers = onValue(usersRef, (snapshot) => {
+      const users = snapshot.val() || {};
+      setConnectedUsers(users);
+      
+      const userList = Object.values(users);
+      const onlineUsers = userList.filter(u => u.isOnline);
+      const videoUsers = onlineUsers.filter(u => u.hasVideo);
+      
+      console.log('👥 Users updated:', {
+        total: userList.length,
+        online: onlineUsers.length,
+        video: videoUsers.length,
+        users: onlineUsers.map(u => `${u.name} (${u.id.substr(-4)})`)
+      });
+      
+      // Video call logic - simplified
+      if (isVideoEnabled && peerConnectionRef.current && !callInProgress.current) {
+        const otherVideoUsers = videoUsers.filter(u => u.id !== userId);
+        
+        if (otherVideoUsers.length > 0) {
+          // Always let the user with smaller ID initiate
+          const shouldInitiate = userId < otherVideoUsers[0].id;
+          
+          if (shouldInitiate) {
+            console.log('🚀 Initiating video call as primary user...');
+            setVideoStatus('🚀 Initiating call...');
+            setTimeout(() => {
+              initiateCall();
+            }, 2000);
+          } else {
+            console.log('⏳ Waiting for incoming video call...');
+            setVideoStatus('⏳ Waiting for call...');
+          }
+        }
+      }
+    });
+    unsubscribersRef.current.push(unsubscribeUsers);
+    
+    // Listen to translation messages
+    const messagesRef = ref(database, `sessions/${sessionCode}/messages`);
+    const unsubscribeMessages = onValue(messagesRef, (snapshot) => {
+      const messagesData = snapshot.val() || {};
+      const messagesList = Object.values(messagesData)
+        .sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+      
+      setMessages(messagesList);
+      
+      // Process new messages
+      messagesList.forEach(message => {
+        handleReceivedMessage(message);
+      });
+    });
+    unsubscribersRef.current.push(unsubscribeMessages);
+    
+    // Listen to WebRTC signaling
+    const webrtcRef = ref(database, `sessions/${sessionCode}/webrtc`);
+    const unsubscribeWebRTC = onValue(webrtcRef, (snapshot) => {
+      const signalingData = snapshot.val() || {};
+      const signalingList = Object.values(signalingData)
+        .filter(signal => signal.senderId !== userId)
+        .filter(signal => !processedSignalingIds.current.has(signal.id))
+        .sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+      
+      console.log('📡 Processing', signalingList.length, 'new signaling messages');
+      
+      signalingList.forEach(signal => {
+        processedSignalingIds.current.add(signal.id);
+        const { data, senderId, senderName } = signal;
+        
+        console.log('📡 Processing signaling from', senderName + ':', data.type);
+        
+        if (data.type === 'offer') {
+          handleOffer(data.offer, senderId);
+        } else if (data.type === 'answer') {
+          handleAnswer(data.answer, senderId);
+        } else if (data.type === 'ice-candidate') {
+          handleIceCandidate(data.candidate, senderId);
+        }
+      });
+    });
+    unsubscribersRef.current.push(unsubscribeWebRTC);
+    
+  }, [userId, isVideoEnabled, initiateCall, handleOffer, handleAnswer, handleIceCandidate, handleReceivedMessage]);
+
+  // Create session
   const createSession = useCallback(async () => {
-    if (!userName.trim()) {
-      setError('Please enter your name');
+    if (!userName.trim() || !apiKey.trim()) {
+      setError('Please enter your name and Gemini API key');
       return;
     }
     
@@ -418,8 +840,10 @@ function PremiumLanguageBridge() {
       setMyTranscript('');
       setReceivedTranscript('');
       lastTranscriptRef.current = '';
+      processedMessageIds.current.clear();
+      processedSignalingIds.current.clear();
+      callInProgress.current = false;
       
-      // Demo: Add current user to connected users
       const userData = {
         id: userId,
         name: userName,
@@ -435,46 +859,27 @@ function PremiumLanguageBridge() {
         }
       };
       
-      setConnectedUsers({ [userId]: userData });
+      await set(ref(database, `sessions/${newCode}/users/${userId}`), userData);
       
       if (isVideoEnabled && stream) {
-        setVideoStatus('Video ready');
+        await setupPeerConnection(stream);
+        setVideoStatus('📹 Video ready');
       }
       
-      // Demo: Add a sample user after 2 seconds
-      setTimeout(() => {
-        const demoUser = {
-          id: 'demo_user_123',
-          name: 'Demo User',
-          language: userLanguage === 'en-US' ? 'hi-IN' : 'en-US',
-          isOnline: true,
-          hasVideo: false,
-          hasAudio: true,
-          joinedAt: Date.now(),
-          deviceInfo: {
-            isMobile: false,
-            isIOS: false
-          }
-        };
-        
-        setConnectedUsers(prev => ({
-          ...prev,
-          [demoUser.id]: demoUser
-        }));
-      }, 2000);
+      setupFirebaseListeners(newCode);
       
-      console.log(`Session created: ${newCode} by ${userName} (${userId.substr(-4)})`);
+      console.log(`✅ Session created: ${newCode} by ${userName} (${userId.substr(-4)})`);
       
     } catch (error) {
-      console.error('Create session failed:', error);
+      console.error('❌ Create session failed:', error);
       setError('Failed to create session: ' + error.message);
     }
-  }, [userName, userLanguage, userId, isVideoEnabled, isAudioEnabled, isMobile, isIOS, initializeMedia]);
+  }, [userName, userLanguage, userId, apiKey, isVideoEnabled, isAudioEnabled, isMobile, isIOS, initializeMedia, setupPeerConnection, setupFirebaseListeners]);
 
-  // Join session (demo version)
+  // Join session
   const joinSession = useCallback(async () => {
-    if (!userName.trim() || !sessionCode.trim()) {
-      setError('Please enter your name and session code');
+    if (!userName.trim() || !sessionCode.trim() || !apiKey.trim()) {
+      setError('Please enter your name, session code, and API key');
       return;
     }
     
@@ -493,8 +898,10 @@ function PremiumLanguageBridge() {
       setMyTranscript('');
       setReceivedTranscript('');
       lastTranscriptRef.current = '';
+      processedMessageIds.current.clear();
+      processedSignalingIds.current.clear();
+      callInProgress.current = false;
       
-      // Demo: Add current user to connected users
       const userData = {
         id: userId,
         name: userName,
@@ -510,44 +917,30 @@ function PremiumLanguageBridge() {
         }
       };
       
-      setConnectedUsers({ [userId]: userData });
+      await set(ref(database, `sessions/${sessionCode}/users/${userId}`), userData);
       
       if (isVideoEnabled && stream) {
-        setVideoStatus('Video ready');
+        await setupPeerConnection(stream);
+        setVideoStatus('📹 Video ready');
       }
       
-      // Demo: Add a sample user after 2 seconds
-      setTimeout(() => {
-        const demoUser = {
-          id: 'demo_user_456',
-          name: 'Other User',
-          language: userLanguage === 'en-US' ? 'es-ES' : 'en-US',
-          isOnline: true,
-          hasVideo: false,
-          hasAudio: true,
-          joinedAt: Date.now(),
-          deviceInfo: {
-            isMobile: true,
-            isIOS: false
-          }
-        };
-        
-        setConnectedUsers(prev => ({
-          ...prev,
-          [demoUser.id]: demoUser
-        }));
-      }, 2000);
+      setupFirebaseListeners(sessionCode);
       
-      console.log(`Joined session: ${sessionCode} as ${userName} (${userId.substr(-4)})`);
+      console.log(`✅ Joined session: ${sessionCode} as ${userName} (${userId.substr(-4)})`);
       
     } catch (error) {
-      console.error('Join session failed:', error);
+      console.error('❌ Join session failed:', error);
       setError('Failed to join session: ' + error.message);
     }
-  }, [userName, sessionCode, userLanguage, userId, isVideoEnabled, isAudioEnabled, isMobile, isIOS, initializeMedia]);
+  }, [userName, sessionCode, userLanguage, userId, apiKey, isVideoEnabled, isAudioEnabled, isMobile, isIOS, initializeMedia, setupPeerConnection, setupFirebaseListeners]);
 
   // Start listening
   const startListening = useCallback(() => {
+    if (!apiKey.trim()) {
+      setError('Please enter Gemini API key');
+      return;
+    }
+    
     const otherUsers = getOtherUsers();
     if (otherUsers.length === 0) {
       setError('No other users connected to translate for');
@@ -561,13 +954,13 @@ function PremiumLanguageBridge() {
       recognitionRef.current = recognition;
       try {
         recognition.start();
-        console.log('Started speech recognition for:', userName);
+        console.log('🎤 Started speech recognition for:', userName);
       } catch (error) {
-        console.error('Recognition start failed:', error);
+        console.error('❌ Recognition start failed:', error);
         setError('Failed to start speech recognition');
       }
     }
-  }, [setupSpeechRecognition, getOtherUsers, initializeAudioContext, userName]);
+  }, [apiKey, setupSpeechRecognition, getOtherUsers, isMobile, initializeAudioContext, userName]);
 
   // Stop listening
   const stopListening = useCallback(() => {
@@ -577,7 +970,7 @@ function PremiumLanguageBridge() {
     }
     setIsListening(false);
     setStatus('online');
-    console.log('Stopped speech recognition for:', userName);
+    console.log('🛑 Stopped speech recognition for:', userName);
   }, [userName]);
 
   // Toggle video
@@ -588,16 +981,17 @@ function PremiumLanguageBridge() {
         if (!stream) return;
         
         setIsVideoEnabled(true);
-        setVideoStatus('Video enabled');
         
-        // Update user data
-        setConnectedUsers(prev => ({
-          ...prev,
-          [userId]: {
-            ...prev[userId],
+        if (currentSessionCode) {
+          await update(ref(database, `sessions/${currentSessionCode}/users/${userId}`), {
             hasVideo: true
-          }
-        }));
+          });
+        }
+
+        if (isConnected) {
+          await setupPeerConnection(stream);
+          setVideoStatus('📹 Video enabled');
+        }
       } catch (error) {
         setError('Failed to enable video: ' + error.message);
       }
@@ -605,32 +999,52 @@ function PremiumLanguageBridge() {
       if (localStream) {
         localStream.getTracks().forEach(track => track.stop());
       }
+      if (peerConnectionRef.current) {
+        peerConnectionRef.current.close();
+        peerConnectionRef.current = null;
+      }
       setIsVideoEnabled(false);
       setLocalStream(null);
       setRemoteStream(null);
       setVideoStatus('');
       setConnectionState('new');
+      callInProgress.current = false;
       
-      // Update user data
-      setConnectedUsers(prev => ({
-        ...prev,
-        [userId]: {
-          ...prev[userId],
+      if (currentSessionCode) {
+        await update(ref(database, `sessions/${currentSessionCode}/users/${userId}`), {
           hasVideo: false
-        }
-      }));
+        });
+      }
     }
-  }, [isVideoEnabled, initializeMedia, userId, localStream]);
+  }, [isVideoEnabled, initializeMedia, currentSessionCode, userId, isConnected, setupPeerConnection, localStream]);
 
   // Leave session
   const leaveSession = useCallback(() => {
-    console.log('Leaving session:', userName);
+    console.log('🚪 Leaving session:', userName);
     
     if (localStream) {
       localStream.getTracks().forEach(track => track.stop());
     }
+    if (remoteStream) {
+      remoteStream.getTracks().forEach(track => track.stop());
+    }
+    if (peerConnectionRef.current) {
+      peerConnectionRef.current.close();
+      peerConnectionRef.current = null;
+    }
     
     stopListening();
+    
+    unsubscribersRef.current.forEach(unsubscribe => {
+      if (typeof unsubscribe === 'function') {
+        unsubscribe();
+      }
+    });
+    unsubscribersRef.current = [];
+    
+    if (currentSessionCode) {
+      remove(ref(database, `sessions/${currentSessionCode}/users/${userId}`));
+    }
     
     // Reset all state
     setIsConnected(false);
@@ -641,19 +1055,26 @@ function PremiumLanguageBridge() {
     setReceivedTranscript('');
     setLocalStream(null);
     setRemoteStream(null);
+    setPeerConnection(null);
     setIsVideoEnabled(false);
     setStatus('offline');
     setVideoStatus('');
     setTranslationStatus('');
+    setPermissionStatus('');
     setConnectionState('new');
     lastTranscriptRef.current = '';
-  }, [localStream, stopListening, userName]);
+    processedMessageIds.current.clear();
+    processedSignalingIds.current.clear();
+    callInProgress.current = false;
+    pendingIceCandidates.current = [];
+  }, [localStream, remoteStream, stopListening, currentSessionCode, userId, userName]);
 
   // Clear transcripts
   const clearTranscripts = useCallback(() => {
     setMyTranscript('');
     setReceivedTranscript('');
     lastTranscriptRef.current = '';
+    processedMessageIds.current.clear();
   }, []);
 
   // Handle video click for mobile
@@ -678,9 +1099,27 @@ function PremiumLanguageBridge() {
   }, [localStream, isMobile]);
 
   useEffect(() => {
+    if (remoteStream && remoteVideoRef.current) {
+      remoteVideoRef.current.srcObject = remoteStream;
+      if (isMobile) {
+        remoteVideoRef.current.setAttribute('playsinline', true);
+        remoteVideoRef.current.setAttribute('autoplay', true);
+        
+        setTimeout(() => {
+          if (remoteVideoRef.current) {
+            remoteVideoRef.current.play().catch(e => {
+              console.log('Remote video autoplay blocked on mobile');
+            });
+          }
+        }, 100);
+      }
+    }
+  }, [remoteStream, isMobile]);
+
+  useEffect(() => {
     const initVoices = () => {
       if (speechSynthesis.getVoices().length > 0) {
-        console.log('Available voices:', speechSynthesis.getVoices().length);
+        console.log('🎵 Available voices:', speechSynthesis.getVoices().length);
       }
     };
     
@@ -694,285 +1133,235 @@ function PremiumLanguageBridge() {
 
   useEffect(() => {
     return () => {
+      unsubscribersRef.current.forEach(unsubscribe => {
+        if (typeof unsubscribe === 'function') {
+          unsubscribe();
+        }
+      });
+      
       if (localStream) {
         localStream.getTracks().forEach(track => track.stop());
+      }
+      if (remoteStream) {
+        remoteStream.getTracks().forEach(track => track.stop());
+      }
+      if (peerConnectionRef.current) {
+        peerConnectionRef.current.close();
       }
       if (audioContextRef.current) {
         audioContextRef.current.close();
       }
     };
-  }, [localStream]);
-
-  const getStatusColor = (currentStatus) => {
-    switch (currentStatus) {
-      case 'online':
-        return '#10b981';
-      case 'listening':
-        return '#3b82f6';
-      case 'translating':
-        return '#8b5cf6';
-      case 'error':
-        return '#ef4444';
-      default:
-        return '#6b7280';
-    }
-  };
-
-  const getConnectionColor = (state) => {
-    switch (state) {
-      case 'connected':
-        return '#10b981';
-      case 'connecting':
-        return '#f59e0b';
-      case 'failed':
-        return '#ef4444';
-      default:
-        return '#6b7280';
-    }
-  };
+  }, [localStream, remoteStream]);
 
   return (
     <div style={{
-      fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif',
+      fontFamily: 'system-ui, -apple-system, sans-serif',
       minHeight: '100vh',
-      background: '#fafafa',
-      color: '#1f2937'
+      background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
+      padding: isMobile ? '10px' : '20px'
     }}>
-      <div style={{ maxWidth: '1200px', margin: '0 auto', padding: isMobile ? '16px' : '24px' }}>
+      <div style={{ maxWidth: '1200px', margin: '0 auto' }}>
         
         {/* Header */}
-        <div style={{ 
-          textAlign: 'center', 
-          marginBottom: isMobile ? '32px' : '48px',
-          paddingTop: isMobile ? '24px' : '32px'
-        }}>
+        <div style={{ textAlign: 'center', marginBottom: isMobile ? '20px' : '30px' }}>
           <h1 style={{
-            fontSize: isMobile ? '28px' : '40px',
-            fontWeight: '700',
-            color: '#111827',
-            marginBottom: '12px',
-            letterSpacing: '-0.025em'
+            color: 'white',
+            fontSize: isMobile ? '2rem' : '2.5rem',
+            marginBottom: '10px',
+            textShadow: '2px 2px 4px rgba(0,0,0,0.3)'
           }}>
-            Language Bridge Pro
+            🌍 Language Bridge Pro
           </h1>
           <p style={{
-            fontSize: isMobile ? '16px' : '18px',
-            color: '#6b7280',
-            fontWeight: '400',
-            lineHeight: '1.6'
+            color: 'rgba(255,255,255,0.9)',
+            fontSize: isMobile ? '1rem' : '1.1rem'
           }}>
-            Real-time voice translation with video chat
+            Real-time voice translation with video chat • Join with a code • Speak naturally
           </p>
-          <div style={{
-            marginTop: '16px',
-            padding: '12px 20px',
-            background: '#fef3c7',
-            border: '1px solid #fbbf24',
-            borderRadius: '12px',
-            color: '#92400e',
-            fontSize: '14px',
-            fontWeight: '500',
-            maxWidth: '600px',
-            margin: '16px auto 0 auto'
-          }}>
-            🚧 Demo Version - This showcases the premium UI design. For full functionality, integrate with Firebase or your preferred backend.
-          </div>
+          {isMobile && (
+            <p style={{
+              color: 'rgba(255,255,255,0.8)',
+              fontSize: '0.9rem',
+              marginTop: '10px'
+            }}>
+              📱 Mobile optimized • {isIOS ? 'iOS Safari' : 'Chrome'} recommended • ID: {userId.substr(-4)}
+            </p>
+          )}
         </div>
 
-        {/* Status Bar */}
+        {/* Enhanced Status Bar */}
         <div style={{
-          background: 'white',
-          borderRadius: '16px',
-          padding: isMobile ? '16px' : '20px',
-          marginBottom: '24px',
-          boxShadow: '0 1px 3px 0 rgba(0, 0, 0, 0.1), 0 1px 2px 0 rgba(0, 0, 0, 0.06)',
-          border: '1px solid #f3f4f6'
+          background: 'rgba(255,255,255,0.95)',
+          borderRadius: '15px',
+          padding: isMobile ? '10px' : '15px',
+          marginBottom: '20px',
+          display: 'flex',
+          justifyContent: 'center',
+          alignItems: 'center',
+          gap: isMobile ? '10px' : '20px',
+          flexWrap: 'wrap'
         }}>
           <div style={{
             display: 'flex',
-            justifyContent: 'center',
             alignItems: 'center',
-            gap: isMobile ? '12px' : '20px',
-            flexWrap: 'wrap'
+            gap: '8px',
+            padding: '8px 16px',
+            borderRadius: '20px',
+            background: status === 'online' ? '#dcfce7' : 
+                       status === 'listening' ? '#fef3c7' : 
+                       status === 'translating' ? '#e0e7ff' : 
+                       status === 'error' ? '#fee2e2' : '#f3f4f6',
+            color: status === 'online' ? '#166534' : 
+                   status === 'listening' ? '#92400e' : 
+                   status === 'translating' ? '#3730a3' : 
+                   status === 'error' ? '#dc2626' : '#6b7280',
+            fontSize: isMobile ? '14px' : '16px'
           }}>
-            {/* Main Status */}
-            <div style={{
-              display: 'flex',
-              alignItems: 'center',
-              gap: '8px',
-              padding: '8px 16px',
-              borderRadius: '12px',
-              background: '#f9fafb',
-              border: `1px solid ${getStatusColor(status)}20`,
-              fontSize: isMobile ? '14px' : '15px',
-              fontWeight: '500'
-            }}>
-              <div style={{
-                width: '8px',
-                height: '8px',
-                borderRadius: '50%',
-                background: getStatusColor(status)
-              }} />
-              <span style={{ color: '#374151', textTransform: 'capitalize' }}>
-                {status === 'offline' ? 'Offline' : 
-                 status === 'online' ? 'Connected' : 
-                 status === 'listening' ? 'Listening' : 
-                 status === 'translating' ? 'Translating' : status}
-              </span>
-            </div>
-            
-            {/* Session Code */}
-            {currentSessionCode && (
-              <div style={{
-                padding: '8px 16px',
-                borderRadius: '12px',
-                background: '#f3f4f6',
-                border: '1px solid #e5e7eb',
-                fontSize: isMobile ? '14px' : '15px',
-                fontWeight: '600',
-                color: '#374151',
-                fontFamily: 'Monaco, "Lucida Console", monospace'
-              }}>
-                {currentSessionCode}
-              </div>
-            )}
-            
-            {/* Users Count */}
-            {getOtherUsers().length > 0 && (
-              <div style={{
-                padding: '8px 16px',
-                borderRadius: '12px',
-                background: '#ecfdf5',
-                border: '1px solid #d1fae5',
-                fontSize: isMobile ? '14px' : '15px',
-                fontWeight: '500',
-                color: '#065f46'
-              }}>
-                {getOtherUsers().length + 1} users
-              </div>
-            )}
-
-            {/* Video Status */}
-            {videoStatus && (
-              <div style={{
-                padding: '8px 16px',
-                borderRadius: '12px',
-                background: '#f0f9ff',
-                border: '1px solid #e0f2fe',
-                fontSize: isMobile ? '13px' : '14px',
-                fontWeight: '500',
-                color: '#0c4a6e',
-                maxWidth: isMobile ? '200px' : 'none',
-                overflow: 'hidden',
-                textOverflow: 'ellipsis',
-                whiteSpace: 'nowrap'
-              }}>
-                {videoStatus}
-              </div>
-            )}
-
-            {/* Translation Status */}
-            {translationStatus && (
-              <div style={{
-                padding: '8px 16px',
-                borderRadius: '12px',
-                background: '#faf5ff',
-                border: '1px solid #e9d5ff',
-                fontSize: isMobile ? '13px' : '14px',
-                fontWeight: '500',
-                color: '#6b21a8'
-              }}>
-                {translationStatus}
-              </div>
-            )}
+            <span>
+              {status === 'online' ? '🟢' : 
+               status === 'listening' ? '🎤' : 
+               status === 'translating' ? '🤖' : 
+               status === 'error' ? '🔴' : '⚪'}
+            </span>
+            <span style={{ fontWeight: 'bold', textTransform: 'capitalize' }}>
+              {status}
+            </span>
           </div>
+          
+          {currentSessionCode && (
+            <div style={{
+              padding: '8px 16px',
+              borderRadius: '20px',
+              background: '#e0e7ff',
+              color: '#3730a3',
+              fontWeight: 'bold',
+              fontSize: isMobile ? '14px' : '16px'
+            }}>
+              📋 {currentSessionCode}
+            </div>
+          )}
+          
+          {getOtherUsers().length > 0 && (
+            <div style={{
+              padding: '8px 16px',
+              borderRadius: '20px',
+              background: '#ecfdf5',
+              color: '#065f46',
+              fontWeight: 'bold',
+              fontSize: isMobile ? '14px' : '16px'
+            }}>
+              👥 {getOtherUsers().length + 1} users
+            </div>
+          )}
+
+          {isConnected && (
+            <div style={{
+              padding: '8px 16px',
+              borderRadius: '20px',
+              background: isListening ? '#fef3c7' : '#f3f4f6',
+              color: isListening ? '#92400e' : '#6b7280',
+              fontWeight: 'bold',
+              fontSize: isMobile ? '14px' : '16px'
+            }}>
+              {isListening ? '🎙️ Live' : '🎙️ Ready'}
+            </div>
+          )}
+
+          {videoStatus && (
+            <div style={{
+              padding: '8px 16px',
+              borderRadius: '20px',
+              background: connectionState === 'connected' ? '#dcfce7' : '#f0f9ff',
+              color: connectionState === 'connected' ? '#166534' : '#1e40af',
+              fontWeight: 'bold',
+              fontSize: isMobile ? '12px' : '14px',
+              maxWidth: isMobile ? '200px' : 'none',
+              overflow: 'hidden',
+              textOverflow: 'ellipsis'
+            }}>
+              {videoStatus}
+            </div>
+          )}
+
+          {translationStatus && (
+            <div style={{
+              padding: '8px 16px',
+              borderRadius: '20px',
+              background: '#fef3c7',
+              color: '#92400e',
+              fontWeight: 'bold',
+              fontSize: isMobile ? '12px' : '14px'
+            }}>
+              {translationStatus}
+            </div>
+          )}
+
+          {permissionStatus && (
+            <div style={{
+              padding: '8px 16px',
+              borderRadius: '20px',
+              background: '#ede9fe',
+              color: '#6b21a8',
+              fontWeight: 'bold',
+              fontSize: isMobile ? '12px' : '14px'
+            }}>
+              {permissionStatus}
+            </div>
+          )}
         </div>
 
         {/* Error */}
         {error && (
           <div style={{
-            background: '#fef2f2',
-            color: '#991b1b',
-            padding: isMobile ? '16px' : '20px',
+            background: '#fee2e2',
+            color: '#dc2626',
+            padding: isMobile ? '12px' : '16px',
             borderRadius: '12px',
-            marginBottom: '24px',
-            border: '1px solid #fecaca',
-            fontSize: isMobile ? '14px' : '15px',
-            fontWeight: '500'
+            marginBottom: '20px',
+            textAlign: 'center',
+            fontWeight: 'bold',
+            border: '2px solid #fca5a5',
+            fontSize: isMobile ? '14px' : '16px'
           }}>
-            {error}
+            ⚠️ {error}
           </div>
         )}
 
         {/* Setup Form */}
         {!isConnected && (
           <div style={{
-            background: 'white',
+            background: 'rgba(255,255,255,0.95)',
             borderRadius: '20px',
-            padding: isMobile ? '24px' : '32px',
-            marginBottom: '32px',
-            boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06)',
-            border: '1px solid #f3f4f6'
+            padding: isMobile ? '20px' : '30px',
+            marginBottom: '30px'
           }}>
-            <h3 style={{ 
-              margin: '0 0 32px 0', 
-              textAlign: 'center', 
-              fontSize: isMobile ? '20px' : '24px',
-              fontWeight: '600',
-              color: '#111827'
-            }}>
-              Get Started
+            <h3 style={{ marginTop: 0, marginBottom: '20px', textAlign: 'center', fontSize: isMobile ? '1.2rem' : '1.5rem' }}>
+              🚀 Get Started
             </h3>
             
             {/* API Key */}
-            <div style={{ marginBottom: '24px' }}>
-              <label style={{ 
-                display: 'block', 
-                marginBottom: '8px', 
-                fontWeight: '500', 
-                fontSize: '15px',
-                color: '#374151'
-              }}>
-                Gemini API Key (Optional for demo)
+            <div style={{ marginBottom: '20px' }}>
+              <label style={{ display: 'block', marginBottom: '8px', fontWeight: 'bold', fontSize: isMobile ? '14px' : '16px' }}>
+                🔑 Gemini API Key:
               </label>
               <input
                 type="password"
                 value={apiKey}
                 onChange={(e) => setApiKey(e.target.value)}
-                placeholder="Enter your API key (optional for UI demo)"
+                placeholder="AIzaSy..."
                 style={{
                   width: '100%',
-                  padding: '16px',
-                  borderRadius: '12px',
-                  border: '1px solid #d1d5db',
+                  padding: isMobile ? '14px' : '12px',
+                  borderRadius: '8px',
+                  border: '2px solid #d1d5db',
                   fontSize: '16px',
-                  boxSizing: 'border-box',
-                  background: '#fafafa',
-                  transition: 'all 0.2s',
-                  outline: 'none'
-                }}
-                onFocus={(e) => {
-                  e.target.style.borderColor = '#3b82f6';
-                  e.target.style.background = 'white';
-                }}
-                onBlur={(e) => {
-                  e.target.style.borderColor = '#d1d5db';
-                  e.target.style.background = '#fafafa';
+                  boxSizing: 'border-box'
                 }}
               />
-              <p style={{ 
-                fontSize: '13px', 
-                color: '#6b7280', 
-                margin: '8px 0 0 0',
-                lineHeight: '1.4'
-              }}>
+              <p style={{ fontSize: '12px', color: '#6b7280', margin: '5px 0 0 0' }}>
                 Get your free API key from{' '}
-                <a 
-                  href="https://makersuite.google.com/app/apikey" 
-                  target="_blank" 
-                  rel="noopener noreferrer" 
-                  style={{ color: '#3b82f6', textDecoration: 'none' }}
-                >
+                <a href="https://makersuite.google.com/app/apikey" target="_blank" rel="noopener noreferrer" style={{ color: '#3b82f6' }}>
                   Google AI Studio
                 </a>
               </p>
@@ -982,18 +1371,12 @@ function PremiumLanguageBridge() {
             <div style={{
               display: 'grid',
               gridTemplateColumns: (window.innerWidth > 600 && !isMobile) ? '1fr 1fr' : '1fr',
-              gap: '20px',
-              marginBottom: '24px'
+              gap: '15px',
+              marginBottom: '20px'
             }}>
               <div>
-                <label style={{ 
-                  display: 'block', 
-                  marginBottom: '8px', 
-                  fontWeight: '500', 
-                  fontSize: '15px',
-                  color: '#374151'
-                }}>
-                  Your Name
+                <label style={{ display: 'block', marginBottom: '8px', fontWeight: 'bold', fontSize: isMobile ? '14px' : '16px' }}>
+                  👤 Your Name:
                 </label>
                 <input
                   type="text"
@@ -1002,53 +1385,34 @@ function PremiumLanguageBridge() {
                   placeholder="Enter your name"
                   style={{
                     width: '100%',
-                    padding: '16px',
-                    borderRadius: '12px',
-                    border: '1px solid #d1d5db',
+                    padding: isMobile ? '14px' : '12px',
+                    borderRadius: '8px',
+                    border: '2px solid #d1d5db',
                     fontSize: '16px',
-                    boxSizing: 'border-box',
-                    background: '#fafafa',
-                    transition: 'all 0.2s',
-                    outline: 'none'
-                  }}
-                  onFocus={(e) => {
-                    e.target.style.borderColor = '#3b82f6';
-                    e.target.style.background = 'white';
-                  }}
-                  onBlur={(e) => {
-                    e.target.style.borderColor = '#d1d5db';
-                    e.target.style.background = '#fafaba';
+                    boxSizing: 'border-box'
                   }}
                 />
               </div>
               
               <div>
-                <label style={{ 
-                  display: 'block', 
-                  marginBottom: '8px', 
-                  fontWeight: '500', 
-                  fontSize: '15px',
-                  color: '#374151'
-                }}>
-                  Your Language
+                <label style={{ display: 'block', marginBottom: '8px', fontWeight: 'bold', fontSize: isMobile ? '14px' : '16px' }}>
+                  🗣️ Your Language:
                 </label>
                 <select
                   value={userLanguage}
                   onChange={(e) => setUserLanguage(e.target.value)}
                   style={{
                     width: '100%',
-                    padding: '16px',
-                    borderRadius: '12px',
-                    border: '1px solid #d1d5db',
+                    padding: isMobile ? '14px' : '12px',
+                    borderRadius: '8px',
+                    border: '2px solid #d1d5db',
                     fontSize: '16px',
-                    boxSizing: 'border-box',
-                    background: '#fafafa',
-                    outline: 'none'
+                    boxSizing: 'border-box'
                   }}
                 >
                   {languages.map(lang => (
                     <option key={lang.code} value={lang.code}>
-                      {lang.flag} {lang.native}
+                      {lang.flag} {lang.native} ({lang.name})
                     </option>
                   ))}
                 </select>
@@ -1058,8 +1422,8 @@ function PremiumLanguageBridge() {
             {/* Media Options */}
             <div style={{
               display: 'flex',
-              gap: '16px',
-              marginBottom: '32px',
+              gap: isMobile ? '15px' : '20px',
+              marginBottom: '20px',
               justifyContent: 'center',
               flexWrap: 'wrap'
             }}>
@@ -1068,26 +1432,20 @@ function PremiumLanguageBridge() {
                 alignItems: 'center',
                 gap: '8px',
                 cursor: 'pointer',
-                padding: '12px 16px',
-                background: '#f9fafb',
+                padding: isMobile ? '14px 16px' : '12px 16px',
+                background: '#f3f4f6',
                 borderRadius: '12px',
-                border: '1px solid #e5e7eb',
-                fontWeight: '500',
-                fontSize: '15px',
-                color: '#374151',
-                transition: 'all 0.2s'
+                fontWeight: 'bold',
+                fontSize: isMobile ? '14px' : '16px',
+                minHeight: '44px'
               }}>
                 <input
                   type="checkbox"
                   checked={isVideoEnabled}
                   onChange={(e) => setIsVideoEnabled(e.target.checked)}
-                  style={{ 
-                    width: '16px', 
-                    height: '16px',
-                    accentColor: '#3b82f6'
-                  }}
+                  style={{ transform: isMobile ? 'scale(1.2)' : 'scale(1)' }}
                 />
-                <span>Enable Video</span>
+                <span>📹 Enable Video</span>
               </label>
 
               <label style={{
@@ -1095,26 +1453,20 @@ function PremiumLanguageBridge() {
                 alignItems: 'center',
                 gap: '8px',
                 cursor: 'pointer',
-                padding: '12px 16px',
-                background: '#f9fafb',
+                padding: isMobile ? '14px 16px' : '12px 16px',
+                background: '#f3f4f6',
                 borderRadius: '12px',
-                border: '1px solid #e5e7eb',
-                fontWeight: '500',
-                fontSize: '15px',
-                color: '#374151',
-                transition: 'all 0.2s'
+                fontWeight: 'bold',
+                fontSize: isMobile ? '14px' : '16px',
+                minHeight: '44px'
               }}>
                 <input
                   type="checkbox"
                   checked={isAudioEnabled}
                   onChange={(e) => setIsAudioEnabled(e.target.checked)}
-                  style={{ 
-                    width: '16px', 
-                    height: '16px',
-                    accentColor: '#3b82f6'
-                  }}
+                  style={{ transform: isMobile ? 'scale(1.2)' : 'scale(1)' }}
                 />
-                <span>Enable Audio</span>
+                <span>🎤 Enable Audio</span>
               </label>
             </div>
             
@@ -1127,31 +1479,24 @@ function PremiumLanguageBridge() {
               <div>
                 <button
                   onClick={createSession}
-                  disabled={!userName.trim()}
+                  disabled={!userName.trim() || !apiKey.trim()}
                   style={{
                     width: '100%',
-                    padding: '16px',
+                    padding: isMobile ? '18px 16px' : '16px',
                     borderRadius: '12px',
                     border: 'none',
-                    background: userName.trim() ? '#3b82f6' : '#d1d5db',
+                    background: (userName.trim() && apiKey.trim()) 
+                      ? 'linear-gradient(135deg, #10b981, #047857)' 
+                      : '#d1d5db',
                     color: 'white',
-                    fontWeight: '600',
-                    fontSize: '16px',
-                    cursor: userName.trim() ? 'pointer' : 'not-allowed',
-                    transition: 'all 0.2s'
-                  }}
-                  onMouseEnter={(e) => {
-                    if (userName.trim()) {
-                      e.target.style.background = '#2563eb';
-                    }
-                  }}
-                  onMouseLeave={(e) => {
-                    if (userName.trim()) {
-                      e.target.style.background = '#3b82f6';
-                    }
+                    fontWeight: 'bold',
+                    fontSize: isMobile ? '16px' : '16px',
+                    cursor: (userName.trim() && apiKey.trim()) ? 'pointer' : 'not-allowed',
+                    transition: 'all 0.2s',
+                    minHeight: '44px'
                   }}
                 >
-                  Create New Session
+                  🚀 Create New Session
                 </button>
               </div>
               
@@ -1160,49 +1505,38 @@ function PremiumLanguageBridge() {
                   type="text"
                   value={sessionCode}
                   onChange={(e) => setSessionCode(e.target.value.toUpperCase())}
-                  placeholder="Session code"
+                  placeholder="Enter session code (e.g., ABC123)"
                   style={{
                     width: '100%',
-                    padding: '16px',
-                    borderRadius: '12px',
-                    border: '1px solid #d1d5db',
+                    padding: isMobile ? '14px' : '12px',
+                    borderRadius: '8px',
+                    border: '2px solid #d1d5db',
                     fontSize: '16px',
                     textAlign: 'center',
-                    marginBottom: '12px',
-                    boxSizing: 'border-box',
-                    background: '#fafafa',
-                    outline: 'none',
-                    fontFamily: 'Monaco, "Lucida Console", monospace',
-                    fontWeight: '600'
+                    marginBottom: '10px',
+                    boxSizing: 'border-box'
                   }}
                 />
                 <button
                   onClick={joinSession}
-                  disabled={!userName.trim() || !sessionCode.trim()}
+                  disabled={!userName.trim() || !sessionCode.trim() || !apiKey.trim()}
                   style={{
                     width: '100%',
-                    padding: '16px',
+                    padding: isMobile ? '18px 16px' : '16px',
                     borderRadius: '12px',
                     border: 'none',
-                    background: (userName.trim() && sessionCode.trim()) ? '#10b981' : '#d1d5db',
+                    background: (userName.trim() && sessionCode.trim() && apiKey.trim()) 
+                      ? 'linear-gradient(135deg, #3b82f6, #1d4ed8)' 
+                      : '#d1d5db',
                     color: 'white',
-                    fontWeight: '600',
-                    fontSize: '16px',
-                    cursor: (userName.trim() && sessionCode.trim()) ? 'pointer' : 'not-allowed',
-                    transition: 'all 0.2s'
-                  }}
-                  onMouseEnter={(e) => {
-                    if (userName.trim() && sessionCode.trim()) {
-                      e.target.style.background = '#059669';
-                    }
-                  }}
-                  onMouseLeave={(e) => {
-                    if (userName.trim() && sessionCode.trim()) {
-                      e.target.style.background = '#10b981';
-                    }
+                    fontWeight: 'bold',
+                    fontSize: isMobile ? '16px' : '16px',
+                    cursor: (userName.trim() && sessionCode.trim() && apiKey.trim()) ? 'pointer' : 'not-allowed',
+                    transition: 'all 0.2s',
+                    minHeight: '44px'
                   }}
                 >
-                  Join Session
+                  🔗 Join Session
                 </button>
               </div>
             </div>
@@ -1212,48 +1546,27 @@ function PremiumLanguageBridge() {
         {/* Main Interface */}
         {isConnected && (
           <>
-            {/* Video Section */}
+            {/* Enhanced Video Section */}
             {(isVideoEnabled || getOtherUsers().some(u => u.hasVideo)) && (
               <div style={{
-                background: 'white',
+                background: 'rgba(255,255,255,0.95)',
                 borderRadius: '20px',
-                padding: isMobile ? '20px' : '24px',
-                marginBottom: '24px',
-                boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06)',
-                border: '1px solid #f3f4f6'
+                padding: isMobile ? '15px' : '20px',
+                marginBottom: '20px'
               }}>
-                <h3 style={{ 
-                  margin: '0 0 20px 0', 
-                  textAlign: 'center', 
-                  fontSize: isMobile ? '18px' : '20px',
-                  fontWeight: '600',
-                  color: '#111827'
-                }}>
-                  Video Chat
-                  {connectionState !== 'new' && (
-                    <span style={{
-                      marginLeft: '12px',
-                      padding: '4px 8px',
-                      borderRadius: '8px',
-                      background: getConnectionColor(connectionState) + '20',
-                      color: getConnectionColor(connectionState),
-                      fontSize: '12px',
-                      fontWeight: '500'
-                    }}>
-                      {connectionState}
-                    </span>
-                  )}
+                <h3 style={{ margin: '0 0 15px 0', textAlign: 'center', fontSize: isMobile ? '1.1rem' : '1.3rem' }}>
+                  📹 Video Chat {connectionState !== 'new' && `(${connectionState})`}
                 </h3>
                 <div style={{
                   display: 'grid',
                   gridTemplateColumns: (window.innerWidth > 768 && !isMobile) ? '1fr 1fr' : '1fr',
-                  gap: isMobile ? '16px' : '20px'
+                  gap: isMobile ? '15px' : '20px'
                 }}>
                   {/* Local Video */}
                   <div style={{
                     position: 'relative',
                     background: '#000',
-                    borderRadius: '16px',
+                    borderRadius: '12px',
                     overflow: 'hidden',
                     aspectRatio: '16/9',
                     minHeight: isMobile ? '200px' : 'auto'
@@ -1280,25 +1593,26 @@ function PremiumLanguageBridge() {
                         display: 'flex',
                         alignItems: 'center',
                         justifyContent: 'center',
-                        height: '100%',
-                        flexDirection: 'column'
+                        height: '100%'
                       }}>
-                        <div style={{ fontSize: isMobile ? '36px' : '48px', marginBottom: '12px' }}>📹</div>
-                        <div style={{ fontSize: isMobile ? '14px' : '16px', color: '#d1d5db' }}>Your video</div>
+                        <div>
+                          <div style={{ fontSize: isMobile ? '36px' : '48px', marginBottom: '10px' }}>📹</div>
+                          <div style={{ fontSize: isMobile ? '14px' : '16px' }}>Your video will appear here</div>
+                        </div>
                       </div>
                     )}
                     <div style={{
                       position: 'absolute',
-                      bottom: '12px',
-                      left: '12px',
-                      background: 'rgba(0,0,0,0.8)',
+                      bottom: '10px',
+                      left: '10px',
+                      background: 'rgba(0,0,0,0.7)',
                       color: 'white',
-                      padding: '6px 12px',
-                      borderRadius: '8px',
-                      fontSize: '12px',
-                      fontWeight: '500'
+                      padding: '5px 10px',
+                      borderRadius: '15px',
+                      fontSize: isMobile ? '12px' : '14px',
+                      fontWeight: 'bold'
                     }}>
-                      You {languages.find(l => l.code === userLanguage)?.flag}
+                      You ({languages.find(l => l.code === userLanguage)?.flag})
                     </div>
                   </div>
 
@@ -1306,7 +1620,7 @@ function PremiumLanguageBridge() {
                   <div style={{
                     position: 'relative',
                     background: '#000',
-                    borderRadius: '16px',
+                    borderRadius: '12px',
                     overflow: 'hidden',
                     aspectRatio: '16/9',
                     display: 'flex',
@@ -1314,33 +1628,47 @@ function PremiumLanguageBridge() {
                     justifyContent: 'center',
                     minHeight: isMobile ? '200px' : 'auto'
                   }}>
-                    <div style={{
-                      color: 'white',
-                      textAlign: 'center',
-                      padding: '20px',
-                      flexDirection: 'column',
-                      display: 'flex',
-                      alignItems: 'center',
-                      justifyContent: 'center'
-                    }}>
-                      <div style={{ fontSize: isMobile ? '36px' : '48px', marginBottom: '12px' }}>👤</div>
-                      <div style={{ fontSize: isMobile ? '14px' : '16px', color: '#d1d5db', textAlign: 'center' }}>
-                        Remote video (Demo)
+                    {remoteStream ? (
+                      <video
+                        ref={remoteVideoRef}
+                        autoPlay
+                        playsInline
+                        onClick={() => handleVideoClick(remoteVideoRef)}
+                        style={{
+                          width: '100%',
+                          height: '100%',
+                          objectFit: 'cover',
+                          cursor: isMobile ? 'pointer' : 'default'
+                        }}
+                      />
+                    ) : (
+                      <div style={{
+                        color: 'white',
+                        textAlign: 'center',
+                        padding: '20px'
+                      }}>
+                        <div style={{ fontSize: isMobile ? '36px' : '48px', marginBottom: '10px' }}>👤</div>
+                        <div style={{ fontSize: isMobile ? '14px' : '16px' }}>
+                          {getOtherUsers().some(u => u.hasVideo) 
+                            ? (connectionState === 'connecting' ? 'Connecting to remote video...' : 
+                               isMobile ? 'Tap to play when connected' : 'Waiting for video connection...') 
+                            : 'Waiting for other users to enable video...'}
+                        </div>
                       </div>
-                    </div>
+                    )}
                     {getOtherUsers()[0] && (
                       <div style={{
                         position: 'absolute',
-                        bottom: '12px',
-                        left: '12px',
-                        background: 'rgba(0,0,0,0.8)',
+                        bottom: '10px',
+                        left: '10px',
+                        background: 'rgba(0,0,0,0.7)',
                         color: 'white',
-                        padding: '6px 12px',
-                        borderRadius: '8px',
-                        fontSize: '12px',
-                        fontWeight: '500'
+                        padding: '5px 10px',
+                        borderRadius: '15px',
+                        fontSize: isMobile ? '12px' : '14px',
+                        fontWeight: 'bold'
                       }}>
-                        {getOtherUsers()[0].name} {languages.find(l => l.code === getOtherUsers()[0].language)?.flag}
+                        {getOtherUsers()[0].name} ({languages.find(l => l.code === getOtherUsers()[0].language)?.flag})
                       </div>
                     )}
                   </div>
@@ -1348,108 +1676,85 @@ function PremiumLanguageBridge() {
               </div>
             )}
 
-            {/* Controls */}
+            {/* Enhanced Controls */}
             <div style={{
-              background: 'white',
+              background: 'rgba(255,255,255,0.95)',
               borderRadius: '20px',
-              padding: isMobile ? '20px' : '24px',
-              marginBottom: '24px',
-              boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06)',
-              border: '1px solid #f3f4f6'
+              padding: isMobile ? '15px' : '20px',
+              marginBottom: '20px'
             }}>
               <div style={{
                 display: 'flex',
                 justifyContent: 'space-between',
                 alignItems: 'center',
                 flexWrap: 'wrap',
-                gap: isMobile ? '12px' : '16px'
+                gap: isMobile ? '10px' : '15px'
               }}>
                 <div style={{ 
                   display: 'flex', 
-                  gap: isMobile ? '12px' : '16px', 
+                  gap: isMobile ? '10px' : '15px', 
                   flexWrap: 'wrap',
-                  alignItems: 'center'
+                  justifyContent: 'center',
+                  width: isMobile ? '100%' : 'auto'
                 }}>
                   <button
                     onClick={isListening ? stopListening : startListening}
                     disabled={getOtherUsers().length === 0}
                     style={{
-                      padding: '12px 24px',
+                      padding: isMobile ? '14px 20px' : '12px 24px',
                       borderRadius: '12px',
                       border: 'none',
-                      background: getOtherUsers().length === 0 ? '#e5e7eb' :
-                                  isListening ? '#ef4444' : '#10b981',
+                      background: getOtherUsers().length === 0 ? '#d1d5db' :
+                                  isListening ? 'linear-gradient(135deg, #ef4444, #dc2626)' 
+                                              : 'linear-gradient(135deg, #10b981, #047857)',
                       color: 'white',
-                      fontWeight: '600',
+                      fontWeight: 'bold',
                       cursor: getOtherUsers().length === 0 ? 'not-allowed' : 'pointer',
-                      fontSize: '15px',
+                      fontSize: isMobile ? '14px' : '16px',
                       transition: 'all 0.2s',
-                      minHeight: '44px'
-                    }}
-                    onMouseEnter={(e) => {
-                      if (getOtherUsers().length > 0) {
-                        e.target.style.transform = 'translateY(-1px)';
-                        e.target.style.boxShadow = '0 4px 8px rgba(0,0,0,0.12)';
-                      }
-                    }}
-                    onMouseLeave={(e) => {
-                      e.target.style.transform = 'translateY(0)';
-                      e.target.style.boxShadow = 'none';
+                      minHeight: '44px',
+                      flexShrink: 0
                     }}
                   >
-                    {isListening ? 'Stop' : 'Listen'}
+                    {isListening ? '🛑 Stop' : '🎤 Listen'}
                   </button>
 
                   <button
                     onClick={toggleVideo}
                     style={{
-                      padding: '12px 20px',
+                      padding: isMobile ? '14px 18px' : '12px 20px',
                       borderRadius: '12px',
                       border: 'none',
-                      background: isVideoEnabled ? '#3b82f6' : '#6b7280',
+                      background: isVideoEnabled ? '#10b981' : '#6b7280',
                       color: 'white',
-                      fontWeight: '600',
+                      fontWeight: 'bold',
                       cursor: 'pointer',
                       transition: 'all 0.2s',
-                      fontSize: '15px',
-                      minHeight: '44px'
-                    }}
-                    onMouseEnter={(e) => {
-                      e.target.style.transform = 'translateY(-1px)';
-                      e.target.style.boxShadow = '0 4px 8px rgba(0,0,0,0.12)';
-                    }}
-                    onMouseLeave={(e) => {
-                      e.target.style.transform = 'translateY(0)';
-                      e.target.style.boxShadow = 'none';
+                      fontSize: isMobile ? '14px' : '16px',
+                      minHeight: '44px',
+                      flexShrink: 0
                     }}
                   >
-                    Video
+                    📹 {isVideoEnabled ? 'On' : 'Off'}
                   </button>
                   
                   <button
                     onClick={() => setIsMuted(!isMuted)}
                     style={{
-                      padding: '12px 20px',
+                      padding: isMobile ? '14px 18px' : '12px 20px',
                       borderRadius: '12px',
                       border: 'none',
-                      background: isMuted ? '#ef4444' : '#6b7280',
+                      background: isMuted ? '#ef4444' : '#3b82f6',
                       color: 'white',
-                      fontWeight: '600',
+                      fontWeight: 'bold',
                       cursor: 'pointer',
                       transition: 'all 0.2s',
-                      fontSize: '15px',
-                      minHeight: '44px'
-                    }}
-                    onMouseEnter={(e) => {
-                      e.target.style.transform = 'translateY(-1px)';
-                      e.target.style.boxShadow = '0 4px 8px rgba(0,0,0,0.12)';
-                    }}
-                    onMouseLeave={(e) => {
-                      e.target.style.transform = 'translateY(0)';
-                      e.target.style.boxShadow = 'none';
+                      fontSize: isMobile ? '14px' : '16px',
+                      minHeight: '44px',
+                      flexShrink: 0
                     }}
                   >
-                    {isMuted ? 'Muted' : 'Audio'}
+                    {isMuted ? '🔇' : '🔊'}
                   </button>
                   
                   <label style={{
@@ -1457,136 +1762,125 @@ function PremiumLanguageBridge() {
                     alignItems: 'center',
                     gap: '8px',
                     cursor: 'pointer',
-                    padding: '12px 16px',
-                    background: autoSpeak ? '#ecfdf5' : '#f9fafb',
-                    border: `1px solid ${autoSpeak ? '#a7f3d0' : '#e5e7eb'}`,
+                    padding: isMobile ? '14px 16px' : '12px 16px',
+                    background: autoSpeak ? '#dcfce7' : '#f3f4f6',
                     borderRadius: '12px',
-                    fontWeight: '500',
-                    color: autoSpeak ? '#065f46' : '#6b7280',
-                    fontSize: '15px',
+                    fontWeight: 'bold',
+                    color: autoSpeak ? '#166534' : '#6b7280',
+                    fontSize: isMobile ? '14px' : '16px',
                     minHeight: '44px',
-                    transition: 'all 0.2s'
+                    flexShrink: 0
                   }}>
                     <input
                       type="checkbox"
                       checked={autoSpeak}
                       onChange={(e) => setAutoSpeak(e.target.checked)}
-                      style={{ 
-                        width: '16px', 
-                        height: '16px',
-                        accentColor: '#10b981'
-                      }}
+                      style={{ transform: isMobile ? 'scale(1.2)' : 'scale(1)' }}
                     />
-                    <span>Auto speak</span>
+                    <span>🗣️ Auto</span>
                   </label>
 
                   <button
                     onClick={clearTranscripts}
                     style={{
-                      padding: '12px 16px',
+                      padding: isMobile ? '14px 18px' : '12px 20px',
                       borderRadius: '12px',
-                      border: '1px solid #d1d5db',
-                      background: 'white',
-                      color: '#6b7280',
-                      fontWeight: '500',
+                      border: '2px solid #f59e0b',
+                      background: 'transparent',
+                      color: '#f59e0b',
+                      fontWeight: 'bold',
                       cursor: 'pointer',
                       transition: 'all 0.2s',
-                      fontSize: '15px',
-                      minHeight: '44px'
-                    }}
-                    onMouseEnter={(e) => {
-                      e.target.style.borderColor = '#9ca3af';
-                      e.target.style.color = '#374151';
-                    }}
-                    onMouseLeave={(e) => {
-                      e.target.style.borderColor = '#d1d5db';
-                      e.target.style.color = '#6b7280';
+                      fontSize: isMobile ? '14px' : '16px',
+                      minHeight: '44px',
+                      flexShrink: 0
                     }}
                   >
-                    Clear
+                    🗑️
                   </button>
                 </div>
                 
                 <button
                   onClick={leaveSession}
                   style={{
-                    padding: '12px 20px',
+                    padding: isMobile ? '14px 18px' : '12px 20px',
                     borderRadius: '12px',
-                    border: '1px solid #ef4444',
-                    background: 'white',
-                    color: '#ef4444',
-                    fontWeight: '600',
+                    border: '2px solid #dc2626',
+                    background: 'transparent',
+                    color: '#dc2626',
+                    fontWeight: 'bold',
                     cursor: 'pointer',
                     transition: 'all 0.2s',
-                    fontSize: '15px',
-                    minHeight: '44px'
-                  }}
-                  onMouseEnter={(e) => {
-                    e.target.style.background = '#ef4444';
-                    e.target.style.color = 'white';
-                  }}
-                  onMouseLeave={(e) => {
-                    e.target.style.background = 'white';
-                    e.target.style.color = '#ef4444';
+                    fontSize: isMobile ? '14px' : '16px',
+                    minHeight: '44px',
+                    width: isMobile ? '100%' : 'auto',
+                    marginTop: isMobile ? '10px' : '0'
                   }}
                 >
-                  Leave
+                  🚪 Leave
                 </button>
               </div>
               
               {getOtherUsers().length === 0 && (
                 <div style={{
-                  marginTop: '16px',
-                  padding: '16px',
-                  background: '#fffbeb',
-                  borderRadius: '12px',
-                  border: '1px solid #fed7aa',
+                  marginTop: '15px',
+                  padding: isMobile ? '12px' : '10px',
+                  background: '#fef3c7',
+                  borderRadius: '8px',
                   color: '#92400e',
                   textAlign: 'center',
-                  fontSize: '14px',
-                  fontWeight: '500'
+                  fontSize: isMobile ? '14px' : '14px',
+                  fontWeight: 'bold'
                 }}>
-                  Waiting for other users to join...
+                  ⏳ Waiting for other users to join for translation...
+                </div>
+              )}
+              
+              {isMobile && isListening && (
+                <div style={{
+                  marginTop: '15px',
+                  padding: '12px',
+                  background: '#e0e7ff',
+                  borderRadius: '8px',
+                  color: '#3730a3',
+                  textAlign: 'center',
+                  fontSize: '14px',
+                  fontWeight: 'bold'
+                }}>
+                  📱 Tap "Stop" to pause listening (saves battery)
                 </div>
               )}
             </div>
 
-            {/* Communication Interface */}
+            {/* Enhanced Communication Interface */}
             <div style={{
               display: 'grid',
               gridTemplateColumns: (window.innerWidth > 768 && !isMobile) ? '1fr 1fr' : '1fr',
-              gap: '24px',
-              marginBottom: '24px'
+              gap: '20px',
+              marginBottom: '20px'
             }}>
               {/* Your Speech */}
               <div style={{
-                background: 'white',
-                borderRadius: '20px',
-                padding: isMobile ? '20px' : '24px',
-                boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06)',
-                border: '1px solid #f3f4f6'
+                background: 'rgba(255,255,255,0.95)',
+                borderRadius: '15px',
+                padding: isMobile ? '15px' : '20px'
               }}>
                 <h3 style={{
-                  margin: '0 0 16px 0',
-                  color: '#111827',
+                  margin: '0 0 15px 0',
+                  color: '#3b82f6',
                   display: 'flex',
                   alignItems: 'center',
                   gap: '8px',
-                  fontSize: isMobile ? '16px' : '18px',
-                  fontWeight: '600'
+                  fontSize: isMobile ? '1rem' : '1.2rem'
                 }}>
-                  You speak
-                  <span style={{ fontSize: '14px', color: '#6b7280', fontWeight: '400' }}>
-                    {languages.find(l => l.code === userLanguage)?.native}
-                  </span>
+                  🗣️ You speak {languages.find(l => l.code === userLanguage)?.native}
                   {isListening && (
                     <span style={{
                       background: '#10b981',
                       color: 'white',
-                      padding: '2px 8px',
-                      borderRadius: '8px',
-                      fontSize: '11px',
-                      fontWeight: '600',
+                      padding: '4px 8px',
+                      borderRadius: '12px',
+                      fontSize: '12px',
                       animation: 'pulse 2s infinite'
                     }}>
                       LIVE
@@ -1594,117 +1888,110 @@ function PremiumLanguageBridge() {
                   )}
                 </h3>
                 <div style={{
-                  background: '#f8fafc',
+                  background: '#f0f9ff',
                   borderRadius: '12px',
-                  padding: '20px',
-                  minHeight: '120px',
-                  border: '1px solid #e2e8f0',
-                  fontSize: '15px',
+                  padding: isMobile ? '15px' : '20px',
+                  minHeight: isMobile ? '100px' : '120px',
+                  border: '2px solid #0ea5e9',
+                  fontSize: isMobile ? '14px' : '16px',
                   lineHeight: '1.6',
                   maxHeight: '200px',
-                  overflowY: 'auto',
-                  color: '#374151'
+                  overflowY: 'auto'
                 }}>
                   {myTranscript || (
-                    <span style={{ color: '#9ca3af', fontStyle: 'italic' }}>
+                    <span style={{ color: '#94a3b8', fontStyle: 'italic' }}>
                       {isListening 
-                        ? 'Listening... Start speaking' 
+                        ? `🎤 Listening... Speak in ${languages.find(l => l.code === userLanguage)?.native}` 
                         : getOtherUsers().length > 0 
-                          ? 'Click "Listen" to start'
-                          : 'Waiting for users...'}
+                          ? 'Click "Listen" to start speaking...'
+                          : 'Waiting for other users to join...'}
                     </span>
                   )}
                 </div>
-                <div style={{ marginTop: '12px' }}>
+                <div style={{ display: 'flex', gap: '10px', marginTop: '10px' }}>
                   <button
                     onClick={() => speakText(myTranscript, userLanguage)}
                     disabled={!myTranscript.trim()}
                     style={{
-                      padding: '8px 16px',
+                      padding: isMobile ? '10px 16px' : '8px 16px',
                       borderRadius: '8px',
                       border: 'none',
-                      background: myTranscript.trim() ? '#10b981' : '#e5e7eb',
+                      background: myTranscript.trim() ? '#10b981' : '#d1d5db',
                       color: 'white',
-                      fontWeight: '500',
+                      fontWeight: 'bold',
                       cursor: myTranscript.trim() ? 'pointer' : 'not-allowed',
                       transition: 'all 0.2s',
-                      fontSize: '14px'
+                      fontSize: isMobile ? '14px' : '14px',
+                      minHeight: '40px'
                     }}
                   >
-                    Replay
+                    🔊 Repeat
                   </button>
                 </div>
               </div>
 
               {/* Received Translations */}
               <div style={{
-                background: 'white',
-                borderRadius: '20px',
-                padding: isMobile ? '20px' : '24px',
-                boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06)',
-                border: '1px solid #f3f4f6'
+                background: 'rgba(255,255,255,0.95)',
+                borderRadius: '15px',
+                padding: isMobile ? '15px' : '20px'
               }}>
                 <h3 style={{
-                  margin: '0 0 16px 0',
-                  color: '#111827',
+                  margin: '0 0 15px 0',
+                  color: '#10b981',
                   display: 'flex',
                   alignItems: 'center',
                   gap: '8px',
-                  fontSize: isMobile ? '16px' : '18px',
-                  fontWeight: '600'
+                  fontSize: isMobile ? '1rem' : '1.2rem'
                 }}>
-                  You hear
-                  <span style={{ fontSize: '14px', color: '#6b7280', fontWeight: '400' }}>
-                    {languages.find(l => l.code === userLanguage)?.native}
-                  </span>
+                  👂 You hear {languages.find(l => l.code === userLanguage)?.native}
                   {autoSpeak && (
                     <span style={{
-                      background: '#3b82f6',
+                      background: '#10b981',
                       color: 'white',
-                      padding: '2px 8px',
-                      borderRadius: '8px',
-                      fontSize: '11px',
-                      fontWeight: '600'
+                      padding: '4px 8px',
+                      borderRadius: '12px',
+                      fontSize: '12px'
                     }}>
                       AUTO
                     </span>
                   )}
                 </h3>
                 <div style={{
-                  background: '#f0fdf4',
+                  background: '#ecfdf5',
                   borderRadius: '12px',
-                  padding: '20px',
-                  minHeight: '120px',
-                  border: '1px solid #dcfce7',
-                  fontSize: '15px',
+                  padding: isMobile ? '15px' : '20px',
+                  minHeight: isMobile ? '100px' : '120px',
+                  border: '2px solid #a7f3d0',
+                  fontSize: isMobile ? '14px' : '16px',
                   lineHeight: '1.6',
                   maxHeight: '200px',
-                  overflowY: 'auto',
-                  color: '#374151'
+                  overflowY: 'auto'
                 }}>
                   {receivedTranscript || (
-                    <span style={{ color: '#9ca3af', fontStyle: 'italic' }}>
-                      Translations will appear here...
+                    <span style={{ color: '#94a3b8', fontStyle: 'italic' }}>
+                      Translations from other users will appear here...
                     </span>
                   )}
                 </div>
-                <div style={{ marginTop: '12px' }}>
+                <div style={{ display: 'flex', gap: '10px', marginTop: '10px' }}>
                   <button
                     onClick={() => speakText(receivedTranscript, userLanguage)}
                     disabled={!receivedTranscript.trim()}
                     style={{
-                      padding: '8px 16px',
+                      padding: isMobile ? '10px 16px' : '8px 16px',
                       borderRadius: '8px',
                       border: 'none',
-                      background: receivedTranscript.trim() ? '#10b981' : '#e5e7eb',
+                      background: receivedTranscript.trim() ? '#10b981' : '#d1d5db',
                       color: 'white',
-                      fontWeight: '500',
+                      fontWeight: 'bold',
                       cursor: receivedTranscript.trim() ? 'pointer' : 'not-allowed',
                       transition: 'all 0.2s',
-                      fontSize: '14px'
+                      fontSize: isMobile ? '14px' : '14px',
+                      minHeight: '40px'
                     }}
                   >
-                    Replay
+                    🔊 Repeat
                   </button>
                 </div>
               </div>
@@ -1712,133 +1999,172 @@ function PremiumLanguageBridge() {
 
             {/* Connected Users */}
             <div style={{
-              background: 'white',
-              borderRadius: '20px',
-              padding: isMobile ? '20px' : '24px',
-              marginBottom: '24px',
-              boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06)',
-              border: '1px solid #f3f4f6'
+              background: 'rgba(255,255,255,0.95)',
+              borderRadius: '15px',
+              padding: isMobile ? '15px' : '20px',
+              marginBottom: '20px'
             }}>
-              <h3 style={{ 
-                margin: '0 0 20px 0', 
-                textAlign: 'center', 
-                fontSize: isMobile ? '18px' : '20px',
-                fontWeight: '600',
-                color: '#111827'
-              }}>
-                Connected Users ({Object.keys(connectedUsers).length})
+              <h3 style={{ margin: '0 0 15px 0', textAlign: 'center', fontSize: isMobile ? '1.1rem' : '1.3rem' }}>
+                👥 Connected Users ({Object.keys(connectedUsers).length})
               </h3>
               <div style={{
                 display: 'grid',
                 gridTemplateColumns: isMobile ? '1fr' : 'repeat(auto-fit, minmax(250px, 1fr))',
-                gap: '16px'
+                gap: '15px'
               }}>
                 {Object.values(connectedUsers).map((user) => (
                   <div key={user.id} style={{
-                    background: user.id === userId ? '#f0f9ff' : '#f9fafb',
-                    borderRadius: '16px',
-                    padding: '20px',
-                    border: `1px solid ${user.id === userId ? '#bfdbfe' : '#f3f4f6'}`,
+                    background: user.id === userId ? '#eff6ff' : '#f8fafc',
+                    borderRadius: '12px',
+                    padding: '15px',
+                    border: `2px solid ${user.id === userId ? '#3b82f6' : '#e2e8f0'}`,
                     textAlign: 'center'
                   }}>
                     <div style={{ 
-                      fontWeight: '600', 
+                      fontWeight: 'bold', 
                       marginBottom: '8px',
-                      fontSize: '16px',
-                      color: '#111827'
+                      fontSize: isMobile ? '15px' : '16px'
                     }}>
                       {user.name} {user.id === userId && '(You)'}
                     </div>
                     <div style={{ 
-                      fontSize: '14px', 
+                      fontSize: isMobile ? '13px' : '14px', 
                       color: '#6b7280',
-                      marginBottom: '12px'
+                      marginBottom: '8px'
                     }}>
                       {languages.find(l => l.code === user.language)?.flag} {' '}
                       {languages.find(l => l.code === user.language)?.native}
+                      {user.deviceInfo?.isMobile && ' 📱'} • {user.id.substr(-4)}
                     </div>
                     <div style={{
                       display: 'flex',
                       justifyContent: 'center',
                       gap: '8px',
-                      marginBottom: '12px',
+                      marginBottom: '8px',
                       flexWrap: 'wrap'
                     }}>
                       {user.hasVideo && (
                         <span style={{
-                          padding: '4px 8px',
+                          padding: '2px 6px',
                           borderRadius: '8px',
                           background: '#dcfce7',
                           color: '#166534',
                           fontSize: '12px',
-                          fontWeight: '500'
+                          fontWeight: 'bold'
                         }}>
-                          Video
+                          📹 Video
                         </span>
                       )}
                       {user.hasAudio && (
                         <span style={{
-                          padding: '4px 8px',
+                          padding: '2px 6px',
                           borderRadius: '8px',
                           background: '#dbeafe',
                           color: '#1e40af',
                           fontSize: '12px',
-                          fontWeight: '500'
+                          fontWeight: 'bold'
                         }}>
-                          Audio
-                        </span>
-                      )}
-                      {user.deviceInfo?.isMobile && (
-                        <span style={{
-                          padding: '4px 8px',
-                          borderRadius: '8px',
-                          background: '#f3f4f6',
-                          color: '#6b7280',
-                          fontSize: '12px',
-                          fontWeight: '500'
-                        }}>
-                          Mobile
+                          🎤 Audio
                         </span>
                       )}
                     </div>
                     <div style={{
-                      padding: '6px 12px',
+                      padding: '4px 8px',
                       borderRadius: '12px',
                       background: user.isOnline ? '#dcfce7' : '#fee2e2',
-                      color: user.isOnline ? '#166534' : '#991b1b',
+                      color: user.isOnline ? '#166534' : '#dc2626',
                       fontSize: '12px',
-                      fontWeight: '600',
-                      display: 'inline-block'
+                      fontWeight: 'bold'
                     }}>
-                      {user.isOnline ? 'Online' : 'Offline'}
+                      {user.isOnline ? '🟢 Online' : '🔴 Offline'}
                     </div>
                   </div>
                 ))}
               </div>
             </div>
+
+            {/* Recent Messages */}
+            {messages.length > 0 && (
+              <div style={{
+                background: 'rgba(255,255,255,0.95)',
+                borderRadius: '15px',
+                padding: isMobile ? '15px' : '20px'
+              }}>
+                <h3 style={{ margin: '0 0 15px 0', textAlign: 'center', fontSize: isMobile ? '1.1rem' : '1.3rem' }}>
+                  💬 Conversation History ({messages.length} messages)
+                </h3>
+                <div style={{
+                  maxHeight: isMobile ? '250px' : '300px',
+                  overflowY: 'auto',
+                  background: '#f8fafc',
+                  borderRadius: '12px',
+                  padding: '15px'
+                }}>
+                  {messages.slice(-10).map((msg, index) => (
+                    <div key={index} style={{
+                      marginBottom: '15px',
+                      padding: '15px',
+                      borderRadius: '12px',
+                      background: msg.senderId === userId ? '#eff6ff' : '#ecfdf5',
+                      border: `1px solid ${msg.senderId === userId ? '#bfdbfe' : '#a7f3d0'}`
+                    }}>
+                      <div style={{
+                        fontWeight: 'bold',
+                        color: msg.senderId === userId ? '#1e40af' : '#065f46',
+                        marginBottom: '8px',
+                        fontSize: isMobile ? '13px' : '14px',
+                        display: 'flex',
+                        justifyContent: 'space-between',
+                        alignItems: 'center',
+                        flexWrap: 'wrap'
+                      }}>
+                        <span>{msg.senderName}:</span>
+                        <span style={{ fontSize: '12px', fontWeight: 'normal', opacity: 0.7 }}>
+                          {msg.timestamp ? new Date(msg.timestamp).toLocaleTimeString() : 'Now'}
+                        </span>
+                      </div>
+                      <div style={{ marginBottom: '8px', fontSize: isMobile ? '14px' : '15px' }}>
+                        "{msg.originalText}"
+                      </div>
+                      {msg.translatedTexts && (
+                        <div style={{
+                          fontSize: isMobile ? '12px' : '13px',
+                          color: '#6b7280',
+                          fontStyle: 'italic',
+                          paddingTop: '8px',
+                          borderTop: '1px solid #e5e7eb'
+                        }}>
+                          {Object.entries(msg.translatedTexts).map(([lang, translation]) => (
+                            <div key={lang} style={{ marginBottom: '2px' }}>
+                              🔄 {languages.find(l => l.code === lang)?.flag} "{translation}"
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
           </>
         )}
 
         {/* Footer */}
         <div style={{
-          background: 'white',
-          borderRadius: '16px',
-          padding: isMobile ? '16px' : '20px',
-          marginTop: '32px',
+          background: 'rgba(255,255,255,0.9)',
+          borderRadius: '15px',
+          padding: isMobile ? '12px' : '15px',
+          marginTop: '20px',
           textAlign: 'center',
-          fontSize: '14px',
-          color: '#6b7280',
-          boxShadow: '0 1px 3px 0 rgba(0, 0, 0, 0.1), 0 1px 2px 0 rgba(0, 0, 0, 0.06)',
-          border: '1px solid #f3f4f6'
+          fontSize: isMobile ? '12px' : '14px',
+          color: '#6b7280'
         }}>
-          <div style={{ fontWeight: '600', color: '#111827', marginBottom: '4px' }}>
-            Language Bridge Pro
-          </div>
-          <div style={{ lineHeight: '1.5' }}>
-            Real-time translation powered by Gemini AI
-            <br />
-            Premium UI Design Demo
-          </div>
+          <strong>🌍 Real-time language translation with video chat</strong> powered by Gemini AI
+          <br />
+          <span style={{ fontSize: isMobile ? '11px' : '12px' }}>
+            Enhanced with WebRTC for video calling • Works best in Chrome/Edge browsers
+            {isMobile && ' • Mobile optimized for touch'}
+          </span>
         </div>
 
         <style jsx>{`
@@ -1852,4 +2178,4 @@ function PremiumLanguageBridge() {
   );
 }
 
-export default PremiumLanguageBridge;
+export default LanguageBridgeWithVideo;
