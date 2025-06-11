@@ -46,12 +46,18 @@ function LanguageBridgeWithVideo() {
   const [error, setError] = useState('');
   const [videoStatus, setVideoStatus] = useState('');
   const [translationStatus, setTranslationStatus] = useState('');
+  const [permissionStatus, setPermissionStatus] = useState('');
   
   // Video state
   const [localStream, setLocalStream] = useState(null);
   const [remoteStream, setRemoteStream] = useState(null);
   const [peerConnection, setPeerConnection] = useState(null);
   const [isCallInitiator, setIsCallInitiator] = useState(false);
+  const [connectionState, setConnectionState] = useState('new');
+  
+  // Mobile detection
+  const [isMobile, setIsMobile] = useState(false);
+  const [isIOS, setIsIOS] = useState(false);
   
   // Refs
   const recognitionRef = useRef(null);
@@ -61,6 +67,8 @@ function LanguageBridgeWithVideo() {
   const unsubscribersRef = useRef([]);
   const peerConnectionRef = useRef(null);
   const processedMessageIds = useRef(new Set());
+  const iceCandidatesBuffer = useRef([]);
+  const audioContextRef = useRef(null);
 
   // Languages with better organization (memoized to prevent re-renders)
   const languages = useMemo(() => [
@@ -86,76 +94,188 @@ function LanguageBridgeWithVideo() {
     { code: 'it-IT', name: 'Italian', native: 'Italiano', flag: '🇮🇹' }
   ], []);
 
+  // Detect mobile and iOS
+  useEffect(() => {
+    const userAgent = navigator.userAgent.toLowerCase();
+    const mobile = /android|webos|iphone|ipad|ipod|blackberry|iemobile|opera mini/i.test(userAgent);
+    const ios = /iphone|ipad|ipod/i.test(userAgent);
+    
+    setIsMobile(mobile);
+    setIsIOS(ios);
+    
+    console.log('📱 Device detection:', { mobile, ios, userAgent });
+  }, []);
+
   // Get other users who are online
   const getOtherUsers = useCallback(() => {
     return Object.values(connectedUsers).filter(user => user.id !== userId && user.isOnline);
   }, [connectedUsers, userId]);
 
-  // Initialize media devices
+  // Initialize audio context for mobile
+  const initializeAudioContext = useCallback(() => {
+    if (!audioContextRef.current && (window.AudioContext || window.webkitAudioContext)) {
+      try {
+        audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)();
+        console.log('🎵 Audio context initialized');
+        
+        // Resume audio context on user interaction (required for iOS)
+        if (audioContextRef.current.state === 'suspended') {
+          audioContextRef.current.resume().then(() => {
+            console.log('🎵 Audio context resumed');
+          });
+        }
+      } catch (error) {
+        console.error('❌ Audio context initialization failed:', error);
+      }
+    }
+  }, []);
+
+  // Enhanced media initialization for mobile
   const initializeMedia = useCallback(async () => {
     try {
-      setVideoStatus('🎥 Requesting camera access...');
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: isVideoEnabled,
-        audio: isAudioEnabled
-      });
+      setVideoStatus('🎥 Requesting permissions...');
+      setPermissionStatus('📋 Checking permissions...');
+      
+      // Initialize audio context first (especially important for iOS)
+      initializeAudioContext();
+      
+      // Mobile-optimized constraints
+      const constraints = {
+        video: isVideoEnabled ? {
+          width: { ideal: isMobile ? 640 : 1280 },
+          height: { ideal: isMobile ? 480 : 720 },
+          frameRate: { ideal: isMobile ? 15 : 30 },
+          facingMode: 'user' // Front camera for mobile
+        } : false,
+        audio: isAudioEnabled ? {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+          // Mobile-specific audio settings
+          sampleRate: isMobile ? 16000 : 44100,
+          channelCount: 1
+        } : false
+      };
+      
+      console.log('📱 Media constraints:', constraints);
+      
+      // Request permissions explicitly on mobile
+      if (isMobile) {
+        try {
+          const permissions = [];
+          if (isAudioEnabled) permissions.push('microphone');
+          if (isVideoEnabled) permissions.push('camera');
+          
+          for (const permission of permissions) {
+            const result = await navigator.permissions.query({ name: permission });
+            console.log(`🔐 ${permission} permission:`, result.state);
+            setPermissionStatus(`🔐 ${permission}: ${result.state}`);
+          }
+        } catch (permError) {
+          console.log('⚠️ Permission API not supported, proceeding with getUserMedia');
+        }
+      }
+      
+      const stream = await navigator.mediaDevices.getUserMedia(constraints);
       
       setLocalStream(stream);
       if (localVideoRef.current) {
         localVideoRef.current.srcObject = stream;
+        // Ensure video plays on mobile
+        if (isMobile) {
+          localVideoRef.current.setAttribute('playsinline', true);
+          localVideoRef.current.setAttribute('autoplay', true);
+          localVideoRef.current.setAttribute('muted', true);
+        }
       }
       
-      setVideoStatus('🎥 Camera initialized');
-      console.log('✅ Media initialized:', { video: isVideoEnabled, audio: isAudioEnabled });
+      setVideoStatus('✅ Media initialized');
+      setPermissionStatus('✅ Permissions granted');
+      console.log('✅ Media initialized:', { 
+        video: isVideoEnabled, 
+        audio: isAudioEnabled,
+        tracks: stream.getTracks().map(t => ({ kind: t.kind, enabled: t.enabled }))
+      });
+      
       return stream;
     } catch (error) {
       console.error('❌ Media access error:', error);
-      setError('Cannot access camera/microphone. Please grant permissions.');
-      setVideoStatus('❌ Camera access denied');
+      let errorMessage = 'Cannot access camera/microphone. ';
+      
+      if (error.name === 'NotAllowedError') {
+        errorMessage += 'Please grant permissions and try again.';
+        setPermissionStatus('❌ Permissions denied');
+      } else if (error.name === 'NotFoundError') {
+        errorMessage += 'No camera/microphone found.';
+        setPermissionStatus('❌ Device not found');
+      } else if (error.name === 'NotReadableError') {
+        errorMessage += 'Device is busy or unavailable.';
+        setPermissionStatus('❌ Device busy');
+      } else {
+        errorMessage += error.message;
+        setPermissionStatus('❌ Unknown error');
+      }
+      
+      if (isMobile) {
+        errorMessage += ' On mobile, ensure you\'re using HTTPS and have granted browser permissions.';
+      }
+      
+      setError(errorMessage);
+      setVideoStatus('❌ Media access failed');
       return null;
     }
-  }, [isVideoEnabled, isAudioEnabled]);
+  }, [isVideoEnabled, isAudioEnabled, isMobile, initializeAudioContext]);
 
   // Send WebRTC signaling data through Firebase
   const sendSignalingData = useCallback(async (data) => {
     if (!currentSessionCode) return;
     
     try {
-      await push(ref(database, `sessions/${currentSessionCode}/signaling`), {
+      const signalingData = {
         senderId: userId,
         senderName: userName,
+        targetId: data.targetId || 'broadcast',
         data: data,
         timestamp: serverTimestamp()
-      });
-      console.log('📡 Signaling data sent:', data.type);
+      };
+      
+      await push(ref(database, `sessions/${currentSessionCode}/signaling`), signalingData);
+      console.log('📡 Signaling data sent:', data.type, 'to:', data.targetId || 'broadcast');
     } catch (error) {
       console.error('❌ Failed to send signaling data:', error);
     }
   }, [currentSessionCode, userId, userName]);
 
-  // Setup WebRTC with proper signaling
-  const setupPeerConnection = useCallback(async (stream) => {
+  // Enhanced WebRTC setup with better mobile support
+  const setupPeerConnection = useCallback(async (stream, targetUserId = null) => {
     if (peerConnectionRef.current) {
       peerConnectionRef.current.close();
     }
 
+    // Enhanced STUN/TURN configuration for better connectivity
     const configuration = {
       iceServers: [
         { urls: 'stun:stun.l.google.com:19302' },
         { urls: 'stun:stun1.l.google.com:19302' },
-        { urls: 'stun:stun2.l.google.com:19302' }
-      ]
+        { urls: 'stun:stun2.l.google.com:19302' },
+        { urls: 'stun:stun3.l.google.com:19302' },
+        { urls: 'stun:stun4.l.google.com:19302' }
+      ],
+      iceCandidatePoolSize: 10,
+      bundlePolicy: 'max-bundle',
+      rtcpMuxPolicy: 'require'
     };
     
     const pc = new RTCPeerConnection(configuration);
     peerConnectionRef.current = pc;
     setPeerConnection(pc);
+    setConnectionState('connecting');
     
     // Add local stream tracks
     if (stream) {
       stream.getTracks().forEach(track => {
         pc.addTrack(track, stream);
-        console.log('➕ Added track to peer connection:', track.kind);
+        console.log('➕ Added track to peer connection:', track.kind, track.enabled);
       });
     }
     
@@ -164,57 +284,103 @@ function LanguageBridgeWithVideo() {
       console.log('📹 Received remote track:', event.track.kind);
       const [remoteStream] = event.streams;
       setRemoteStream(remoteStream);
+      
       if (remoteVideoRef.current) {
         remoteVideoRef.current.srcObject = remoteStream;
+        
+        // Ensure remote video plays on mobile
+        if (isMobile) {
+          remoteVideoRef.current.setAttribute('playsinline', true);
+          remoteVideoRef.current.setAttribute('autoplay', true);
+          
+          // Force play on mobile
+          setTimeout(() => {
+            if (remoteVideoRef.current) {
+              remoteVideoRef.current.play().catch(e => {
+                console.log('Remote video autoplay blocked, user interaction required');
+              });
+            }
+          }, 100);
+        }
       }
+      
       setVideoStatus('📹 Remote video connected');
+      setConnectionState('connected');
     };
     
-    // Handle ICE candidates
+    // Handle ICE candidates with buffering
     pc.onicecandidate = (event) => {
       if (event.candidate) {
-        console.log('🧊 ICE candidate generated');
+        console.log('🧊 ICE candidate generated:', event.candidate.type);
         sendSignalingData({
           type: 'ice-candidate',
-          candidate: event.candidate
+          candidate: event.candidate,
+          targetId: targetUserId
         });
+      } else {
+        console.log('🧊 ICE gathering complete');
       }
     };
 
-    // Handle connection state changes
+    // Enhanced connection state handling
     pc.onconnectionstatechange = () => {
-      console.log('🔗 Connection state:', pc.connectionState);
-      setVideoStatus(`🔗 Connection: ${pc.connectionState}`);
+      const state = pc.connectionState;
+      console.log('🔗 Connection state changed:', state);
+      setConnectionState(state);
       
-      if (pc.connectionState === 'connected') {
+      if (state === 'connected') {
         setVideoStatus('✅ Video call connected');
-      } else if (pc.connectionState === 'disconnected') {
-        setVideoStatus('❌ Video call disconnected');
-      } else if (pc.connectionState === 'failed') {
-        setVideoStatus('❌ Video call failed');
-        // Attempt to restart connection
+        setError('');
+      } else if (state === 'disconnected') {
+        setVideoStatus('⚠️ Connection lost, reconnecting...');
+        // Attempt to reconnect
         setTimeout(() => {
-          if (isVideoEnabled) {
-            setupPeerConnection(stream);
+          if (pc.connectionState === 'disconnected') {
+            console.log('🔄 Attempting to reconnect...');
+            createOffer(targetUserId);
           }
         }, 3000);
+      } else if (state === 'failed') {
+        setVideoStatus('❌ Connection failed');
+        setError('Video connection failed. Please try again.');
+        // Restart connection
+        setTimeout(() => {
+          if (isVideoEnabled) {
+            setupPeerConnection(stream, targetUserId);
+          }
+        }, 5000);
+      } else if (state === 'connecting') {
+        setVideoStatus('🔄 Connecting...');
       }
     };
 
     pc.oniceconnectionstatechange = () => {
       console.log('❄️ ICE connection state:', pc.iceConnectionState);
+      
+      if (pc.iceConnectionState === 'failed') {
+        console.log('❄️ ICE connection failed, restarting...');
+        pc.restartIce();
+      }
     };
+
+    // Handle buffered ICE candidates
+    iceCandidatesBuffer.current.forEach(candidate => {
+      pc.addIceCandidate(candidate).catch(e => {
+        console.error('❌ Error adding buffered ICE candidate:', e);
+      });
+    });
+    iceCandidatesBuffer.current = [];
     
     return pc;
-  }, [sendSignalingData, isVideoEnabled]);
+  }, [sendSignalingData, isVideoEnabled, isMobile]);
 
   // Create offer for video call
-  const createOffer = useCallback(async () => {
+  const createOffer = useCallback(async (targetUserId = null) => {
     const pc = peerConnectionRef.current;
     if (!pc) return;
 
     try {
-      console.log('📞 Creating offer...');
+      console.log('📞 Creating offer for:', targetUserId || 'broadcast');
       setVideoStatus('📞 Creating call offer...');
       
       const offer = await pc.createOffer({
@@ -226,7 +392,8 @@ function LanguageBridgeWithVideo() {
       
       await sendSignalingData({
         type: 'offer',
-        offer: offer
+        offer: offer,
+        targetId: targetUserId
       });
       
       console.log('✅ Offer sent');
@@ -234,16 +401,17 @@ function LanguageBridgeWithVideo() {
     } catch (error) {
       console.error('❌ Error creating offer:', error);
       setVideoStatus('❌ Failed to create offer');
+      setError('Failed to create video call offer');
     }
   }, [sendSignalingData]);
 
   // Handle received offer
-  const handleOffer = useCallback(async (offer) => {
+  const handleOffer = useCallback(async (offer, senderId) => {
     const pc = peerConnectionRef.current;
     if (!pc) return;
 
     try {
-      console.log('📞 Received offer, creating answer...');
+      console.log('📞 Received offer from:', senderId);
       setVideoStatus('📞 Received call, answering...');
       
       await pc.setRemoteDescription(new RTCSessionDescription(offer));
@@ -253,40 +421,49 @@ function LanguageBridgeWithVideo() {
       
       await sendSignalingData({
         type: 'answer',
-        answer: answer
+        answer: answer,
+        targetId: senderId
       });
       
-      console.log('✅ Answer sent');
+      console.log('✅ Answer sent to:', senderId);
       setVideoStatus('✅ Call answered');
     } catch (error) {
       console.error('❌ Error handling offer:', error);
       setVideoStatus('❌ Failed to answer call');
+      setError('Failed to answer video call');
     }
   }, [sendSignalingData]);
 
   // Handle received answer
-  const handleAnswer = useCallback(async (answer) => {
+  const handleAnswer = useCallback(async (answer, senderId) => {
     const pc = peerConnectionRef.current;
     if (!pc) return;
 
     try {
-      console.log('✅ Received answer');
+      console.log('✅ Received answer from:', senderId);
       await pc.setRemoteDescription(new RTCSessionDescription(answer));
       setVideoStatus('✅ Call established');
     } catch (error) {
       console.error('❌ Error handling answer:', error);
       setVideoStatus('❌ Failed to establish call');
+      setError('Failed to establish video call');
     }
   }, []);
 
-  // Handle ICE candidate
-  const handleIceCandidate = useCallback(async (candidate) => {
+  // Handle ICE candidate with improved error handling
+  const handleIceCandidate = useCallback(async (candidate, senderId) => {
     const pc = peerConnectionRef.current;
-    if (!pc) return;
+    
+    if (!pc) {
+      // Buffer ICE candidates if peer connection not ready
+      iceCandidatesBuffer.current.push(candidate);
+      console.log('🧊 Buffering ICE candidate from:', senderId);
+      return;
+    }
 
     try {
       await pc.addIceCandidate(new RTCIceCandidate(candidate));
-      console.log('🧊 ICE candidate added');
+      console.log('🧊 ICE candidate added from:', senderId);
     } catch (error) {
       console.error('❌ Error adding ICE candidate:', error);
     }
@@ -354,33 +531,45 @@ function LanguageBridgeWithVideo() {
     }
   }, [apiKey, languages]);
 
-  // Enhanced speech synthesis with voice selection
+  // Enhanced speech synthesis with mobile optimizations
   const speakText = useCallback((text, languageCode) => {
     if (!text || isMuted || !window.speechSynthesis) return;
     
-    console.log('🗣️ Speaking:', { text, languageCode });
+    console.log('🗣️ Speaking:', { text, languageCode, isMobile });
+    
+    // Initialize audio context on user interaction (important for mobile)
+    initializeAudioContext();
     
     // Stop any ongoing speech
     speechSynthesis.cancel();
     
     const utterance = new SpeechSynthesisUtterance(text);
     utterance.lang = languageCode;
-    utterance.rate = 0.9;
+    utterance.rate = isMobile ? 0.8 : 0.9; // Slightly slower on mobile
     utterance.volume = 0.8;
     utterance.pitch = 1.0;
     
-    // Try to find the best voice for the language
+    // Mobile-optimized voice selection
     const voices = speechSynthesis.getVoices();
     const langCode = languageCode.split('-')[0];
     
-    // Prefer native voices, then system voices
-    const preferredVoice = voices.find(v => 
-      v.lang === languageCode || v.lang.startsWith(langCode)
-    );
+    // Prefer local voices on mobile, cloud voices on desktop
+    let preferredVoice;
+    if (isMobile) {
+      preferredVoice = voices.find(v => 
+        (v.lang === languageCode || v.lang.startsWith(langCode)) && v.localService
+      ) || voices.find(v => 
+        v.lang === languageCode || v.lang.startsWith(langCode)
+      );
+    } else {
+      preferredVoice = voices.find(v => 
+        v.lang === languageCode || v.lang.startsWith(langCode)
+      );
+    }
     
     if (preferredVoice) {
       utterance.voice = preferredVoice;
-      console.log('🎵 Using voice:', preferredVoice.name);
+      console.log('🎵 Using voice:', preferredVoice.name, 'Local:', preferredVoice.localService);
     }
     
     utterance.onstart = () => {
@@ -393,10 +582,27 @@ function LanguageBridgeWithVideo() {
     
     utterance.onerror = (event) => {
       console.error('❌ Speech synthesis error:', event);
+      // On mobile, sometimes speech fails silently - try again
+      if (isMobile && event.error === 'synthesis-failed') {
+        setTimeout(() => {
+          console.log('🔄 Retrying speech on mobile...');
+          speechSynthesis.speak(utterance);
+        }, 1000);
+      }
     };
     
-    speechSynthesis.speak(utterance);
-  }, [isMuted]);
+    // On iOS, speech synthesis needs user interaction
+    if (isIOS) {
+      const speakWithDelay = () => {
+        setTimeout(() => {
+          speechSynthesis.speak(utterance);
+        }, 100);
+      };
+      speakWithDelay();
+    } else {
+      speechSynthesis.speak(utterance);
+    }
+  }, [isMuted, isMobile, isIOS, initializeAudioContext]);
 
   // Send translation message to Firebase
   const sendTranslationMessage = useCallback(async (originalText, translatedTexts) => {
@@ -407,7 +613,7 @@ function LanguageBridgeWithVideo() {
       senderName: userName,
       originalText: originalText,
       originalLang: userLanguage,
-      translatedTexts: translatedTexts, // Object with target languages as keys
+      translatedTexts: translatedTexts,
       timestamp: serverTimestamp(),
       type: 'translation',
       messageId: `${userId}_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
@@ -422,26 +628,36 @@ function LanguageBridgeWithVideo() {
     }
   }, [currentSessionCode, userId, userName, userLanguage]);
 
-  // Enhanced speech recognition with better handling
+  // Enhanced speech recognition with mobile support
   const setupSpeechRecognition = useCallback(() => {
     if (!window.webkitSpeechRecognition && !window.SpeechRecognition) {
-      setError('Speech recognition not supported. Use Chrome or Edge browser.');
+      setError('Speech recognition not supported. Please use Chrome or Safari browser.');
       return null;
     }
 
     const SpeechRecognition = window.webkitSpeechRecognition || window.SpeechRecognition;
     const recognition = new SpeechRecognition();
     
-    recognition.continuous = true;
+    // Mobile-optimized settings
+    recognition.continuous = !isMobile; // On mobile, use shorter sessions
     recognition.interimResults = true;
     recognition.lang = userLanguage;
     recognition.maxAlternatives = 1;
+    
+    // Mobile-specific settings
+    if (isMobile) {
+      recognition.continuous = false; // Better for mobile battery
+      recognition.maxAlternatives = 1;
+    }
 
     recognition.onstart = () => {
       setIsListening(true);
       setStatus('listening');
       setError('');
       console.log('🎤 Speech recognition started');
+      
+      // Initialize audio context on start (mobile requirement)
+      initializeAudioContext();
     };
 
     recognition.onresult = async (event) => {
@@ -507,39 +723,63 @@ function LanguageBridgeWithVideo() {
 
     recognition.onerror = (event) => {
       console.error('❌ Speech recognition error:', event.error);
+      
       if (event.error === 'no-speech') {
         // Don't show error for no speech
         return;
       }
-      if (event.error === 'network') {
-        setError('Network error during speech recognition');
-      } else if (event.error === 'not-allowed') {
-        setError('Microphone access denied. Please allow microphone access.');
-      } else {
-        setError(`Speech recognition error: ${event.error}`);
+      
+      let errorMessage = '';
+      switch (event.error) {
+        case 'network':
+          errorMessage = 'Network error during speech recognition';
+          break;
+        case 'not-allowed':
+          errorMessage = 'Microphone access denied. Please grant permissions.';
+          if (isMobile) {
+            errorMessage += ' On mobile, ensure location is HTTPS.';
+          }
+          break;
+        case 'audio-capture':
+          errorMessage = 'No microphone found or audio capture failed.';
+          break;
+        case 'aborted':
+          errorMessage = 'Speech recognition was aborted.';
+          break;
+        default:
+          errorMessage = `Speech recognition error: ${event.error}`;
       }
+      
+      setError(errorMessage);
     };
 
     recognition.onend = () => {
       setIsListening(false);
       if (isConnected && !error) {
         setStatus('online');
-        // Auto-restart recognition if still connected
-        setTimeout(() => {
-          if (isConnected && recognitionRef.current === recognition) {
-            try {
-              recognition.start();
-              console.log('🔄 Speech recognition restarted');
-            } catch (e) {
-              console.log('❌ Recognition restart failed:', e);
+        
+        // Auto-restart on mobile with user interaction
+        if (isMobile) {
+          // Don't auto-restart on mobile to save battery
+          console.log('🔋 Speech recognition ended (mobile - manual restart required)');
+        } else {
+          // Auto-restart on desktop
+          setTimeout(() => {
+            if (isConnected && recognitionRef.current === recognition) {
+              try {
+                recognition.start();
+                console.log('🔄 Speech recognition restarted');
+              } catch (e) {
+                console.log('❌ Recognition restart failed:', e);
+              }
             }
-          }
-        }, 1000);
+          }, 1000);
+        }
       }
     };
 
     return recognition;
-  }, [userLanguage, getOtherUsers, translateText, sendTranslationMessage, isConnected, error]);
+  }, [userLanguage, getOtherUsers, translateText, sendTranslationMessage, isConnected, error, isMobile, initializeAudioContext]);
 
   // Handle received translation messages
   const handleReceivedMessage = useCallback((message) => {
@@ -576,7 +816,7 @@ function LanguageBridgeWithVideo() {
     }
   }, [userId, userLanguage, autoSpeak, speakText]);
 
-  // Setup Firebase listeners
+  // Setup Firebase listeners with enhanced signaling
   const setupFirebaseListeners = useCallback((sessionCode) => {
     // Clear processed messages when setting up new listeners
     processedMessageIds.current.clear();
@@ -588,15 +828,15 @@ function LanguageBridgeWithVideo() {
       setConnectedUsers(users);
       console.log('👥 Users updated:', Object.keys(users).length, 'users connected');
       
-      // Check if there are other users with video to initiate call
-      const otherUsers = Object.values(users).filter(u => u.id !== userId && u.hasVideo);
+      // Enhanced video call initiation
+      const otherUsers = Object.values(users).filter(u => u.id !== userId && u.hasVideo && u.isOnline);
       if (otherUsers.length > 0 && isVideoEnabled && peerConnectionRef.current) {
-        // If I'm the newer user (higher userId), I should initiate the call
-        const shouldInitiate = otherUsers.some(u => u.id < userId);
+        // More sophisticated call initiation based on user ID comparison
+        const shouldInitiate = userId > otherUsers[0].id; // Consistent ordering
         if (shouldInitiate && !isCallInitiator) {
-          console.log('🚀 Initiating video call as newer user');
+          console.log('🚀 Initiating video call to:', otherUsers[0].name);
           setIsCallInitiator(true);
-          setTimeout(() => createOffer(), 2000); // Wait a bit for peer connection to be ready
+          setTimeout(() => createOffer(otherUsers[0].id), 2000);
         }
       }
     });
@@ -618,23 +858,26 @@ function LanguageBridgeWithVideo() {
     });
     unsubscribersRef.current.push(unsubscribeMessages);
     
-    // Listen to WebRTC signaling
+    // Enhanced WebRTC signaling listener
     const signalingRef = ref(database, `sessions/${sessionCode}/signaling`);
     const unsubscribeSignaling = onValue(signalingRef, (snapshot) => {
       const signalingData = snapshot.val() || {};
       const signalingList = Object.values(signalingData)
         .filter(signal => signal.senderId !== userId) // Only process signals from other users
+        .filter(signal => !signal.targetId || signal.targetId === 'broadcast' || signal.targetId === userId) // Only for me
         .sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
       
-      // Process latest signaling data
+      // Process signaling data
       signalingList.forEach(signal => {
-        const { data } = signal;
+        const { data, senderId } = signal;
+        console.log('📡 Processing signaling:', data.type, 'from:', senderId);
+        
         if (data.type === 'offer') {
-          handleOffer(data.offer);
+          handleOffer(data.offer, senderId);
         } else if (data.type === 'answer') {
-          handleAnswer(data.answer);
+          handleAnswer(data.answer, senderId);
         } else if (data.type === 'ice-candidate') {
-          handleIceCandidate(data.candidate);
+          handleIceCandidate(data.candidate, senderId);
         }
       });
     });
@@ -642,7 +885,7 @@ function LanguageBridgeWithVideo() {
     
   }, [userId, isVideoEnabled, createOffer, handleOffer, handleAnswer, handleIceCandidate, isCallInitiator, handleReceivedMessage]);
 
-  // Create session with video setup
+  // Create session with enhanced setup
   const createSession = useCallback(async () => {
     if (!userName.trim()) {
       setError('Please enter your name');
@@ -672,6 +915,7 @@ function LanguageBridgeWithVideo() {
       setIsCallInitiator(false);
       lastTranscriptRef.current = '';
       processedMessageIds.current.clear();
+      iceCandidatesBuffer.current = [];
       
       // Add user to Firebase session
       const userData = {
@@ -681,7 +925,12 @@ function LanguageBridgeWithVideo() {
         isOnline: true,
         hasVideo: isVideoEnabled,
         hasAudio: isAudioEnabled,
-        joinedAt: serverTimestamp()
+        joinedAt: serverTimestamp(),
+        deviceInfo: {
+          isMobile,
+          isIOS,
+          userAgent: navigator.userAgent.substring(0, 100)
+        }
       };
       
       await set(ref(database, `sessions/${newCode}/users/${userId}`), userData);
@@ -701,9 +950,9 @@ function LanguageBridgeWithVideo() {
       console.error('❌ Create session failed:', error);
       setError('Failed to create session: ' + error.message);
     }
-  }, [userName, userLanguage, userId, apiKey, isVideoEnabled, isAudioEnabled, initializeMedia, setupPeerConnection, setupFirebaseListeners]);
+  }, [userName, userLanguage, userId, apiKey, isVideoEnabled, isAudioEnabled, isMobile, isIOS, initializeMedia, setupPeerConnection, setupFirebaseListeners]);
 
-  // Join session with video setup
+  // Join session with enhanced setup
   const joinSession = useCallback(async () => {
     if (!userName.trim()) {
       setError('Please enter your name');
@@ -736,6 +985,7 @@ function LanguageBridgeWithVideo() {
       setIsCallInitiator(false);
       lastTranscriptRef.current = '';
       processedMessageIds.current.clear();
+      iceCandidatesBuffer.current = [];
       
       // Add user to Firebase session
       const userData = {
@@ -745,7 +995,12 @@ function LanguageBridgeWithVideo() {
         isOnline: true,
         hasVideo: isVideoEnabled,
         hasAudio: isAudioEnabled,
-        joinedAt: serverTimestamp()
+        joinedAt: serverTimestamp(),
+        deviceInfo: {
+          isMobile,
+          isIOS,
+          userAgent: navigator.userAgent.substring(0, 100)
+        }
       };
       
       await set(ref(database, `sessions/${sessionCode}/users/${userId}`), userData);
@@ -765,9 +1020,9 @@ function LanguageBridgeWithVideo() {
       console.error('❌ Join session failed:', error);
       setError('Failed to join session: ' + error.message);
     }
-  }, [userName, sessionCode, userLanguage, userId, apiKey, isVideoEnabled, isAudioEnabled, initializeMedia, setupPeerConnection, setupFirebaseListeners]);
+  }, [userName, sessionCode, userLanguage, userId, apiKey, isVideoEnabled, isAudioEnabled, isMobile, isIOS, initializeMedia, setupPeerConnection, setupFirebaseListeners]);
 
-  // Start listening
+  // Enhanced start listening with mobile support
   const startListening = useCallback(() => {
     if (!apiKey.trim()) {
       setError('Please enter Gemini API key');
@@ -780,6 +1035,9 @@ function LanguageBridgeWithVideo() {
       return;
     }
     
+    // Initialize audio context first (required for mobile)
+    initializeAudioContext();
+    
     const recognition = setupSpeechRecognition();
     if (recognition) {
       recognitionRef.current = recognition;
@@ -788,10 +1046,10 @@ function LanguageBridgeWithVideo() {
         console.log('🎤 Started speech recognition');
       } catch (error) {
         console.error('❌ Recognition start failed:', error);
-        setError('Failed to start speech recognition');
+        setError('Failed to start speech recognition. ' + (isMobile ? 'On mobile, tap to enable microphone.' : ''));
       }
     }
-  }, [apiKey, setupSpeechRecognition, getOtherUsers]);
+  }, [apiKey, setupSpeechRecognition, getOtherUsers, isMobile, initializeAudioContext]);
 
   // Stop listening
   const stopListening = useCallback(() => {
@@ -804,19 +1062,14 @@ function LanguageBridgeWithVideo() {
     console.log('🛑 Stopped speech recognition');
   }, []);
 
-  // Toggle video
+  // Enhanced toggle video with mobile support
   const toggleVideo = useCallback(async () => {
     if (!isVideoEnabled) {
       // Turn on video
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({ 
-          video: true, 
-          audio: isAudioEnabled 
-        });
-        setLocalStream(stream);
-        if (localVideoRef.current) {
-          localVideoRef.current.srcObject = stream;
-        }
+        const stream = await initializeMedia();
+        if (!stream) return;
+        
         setIsVideoEnabled(true);
         
         // Update in Firebase
@@ -828,8 +1081,16 @@ function LanguageBridgeWithVideo() {
 
         // Setup peer connection if connected
         if (isConnected) {
-          await setupPeerConnection(stream);
-          setVideoStatus('📹 Video enabled, waiting for connection...');
+          const otherUsers = getOtherUsers();
+          if (otherUsers.length > 0) {
+            await setupPeerConnection(stream, otherUsers[0].id);
+            setVideoStatus('📹 Video enabled, connecting...');
+            
+            // Initiate call if appropriate
+            if (userId > otherUsers[0].id) {
+              setTimeout(() => createOffer(otherUsers[0].id), 1000);
+            }
+          }
         }
       } catch (error) {
         setError('Failed to enable video: ' + error.message);
@@ -837,7 +1098,7 @@ function LanguageBridgeWithVideo() {
     } else {
       // Turn off video
       if (localStream) {
-        localStream.getVideoTracks().forEach(track => track.stop());
+        localStream.getTracks().forEach(track => track.stop());
       }
       if (peerConnectionRef.current) {
         peerConnectionRef.current.close();
@@ -847,6 +1108,7 @@ function LanguageBridgeWithVideo() {
       setLocalStream(null);
       setRemoteStream(null);
       setVideoStatus('');
+      setConnectionState('new');
       
       // Update in Firebase
       if (currentSessionCode) {
@@ -855,9 +1117,9 @@ function LanguageBridgeWithVideo() {
         });
       }
     }
-  }, [isVideoEnabled, isAudioEnabled, localStream, currentSessionCode, userId, isConnected, setupPeerConnection]);
+  }, [isVideoEnabled, initializeMedia, currentSessionCode, userId, isConnected, getOtherUsers, setupPeerConnection, createOffer, localStream]);
 
-  // Leave session
+  // Leave session with complete cleanup
   const leaveSession = useCallback(() => {
     // Stop media
     if (localStream) {
@@ -901,9 +1163,12 @@ function LanguageBridgeWithVideo() {
     setStatus('offline');
     setVideoStatus('');
     setTranslationStatus('');
+    setPermissionStatus('');
     setIsCallInitiator(false);
+    setConnectionState('new');
     lastTranscriptRef.current = '';
     processedMessageIds.current.clear();
+    iceCandidatesBuffer.current = [];
   }, [localStream, remoteStream, stopListening, currentSessionCode, userId]);
 
   // Clear transcripts
@@ -914,18 +1179,61 @@ function LanguageBridgeWithVideo() {
     processedMessageIds.current.clear();
   }, []);
 
+  // Force video play on mobile (user interaction required)
+  const handleVideoClick = useCallback((videoRef) => {
+    if (videoRef.current && isMobile) {
+      videoRef.current.play().catch(e => {
+        console.log('Video play failed:', e);
+      });
+    }
+  }, [isMobile]);
+
   // Effect to handle media when video state changes
   useEffect(() => {
     if (localStream && localVideoRef.current) {
       localVideoRef.current.srcObject = localStream;
+      if (isMobile) {
+        localVideoRef.current.setAttribute('playsinline', true);
+        localVideoRef.current.setAttribute('autoplay', true);
+        localVideoRef.current.setAttribute('muted', true);
+      }
     }
-  }, [localStream]);
+  }, [localStream, isMobile]);
 
   useEffect(() => {
     if (remoteStream && remoteVideoRef.current) {
       remoteVideoRef.current.srcObject = remoteStream;
+      if (isMobile) {
+        remoteVideoRef.current.setAttribute('playsinline', true);
+        remoteVideoRef.current.setAttribute('autoplay', true);
+        
+        // Auto-play might fail on mobile, so set up click handler
+        setTimeout(() => {
+          if (remoteVideoRef.current) {
+            remoteVideoRef.current.play().catch(e => {
+              console.log('Remote video autoplay blocked on mobile');
+            });
+          }
+        }, 100);
+      }
     }
-  }, [remoteStream]);
+  }, [remoteStream, isMobile]);
+
+  // Initialize voices for speech synthesis
+  useEffect(() => {
+    const initVoices = () => {
+      if (speechSynthesis.getVoices().length > 0) {
+        console.log('🎵 Available voices:', speechSynthesis.getVoices().length);
+      }
+    };
+    
+    initVoices();
+    speechSynthesis.addEventListener('voiceschanged', initVoices);
+    
+    return () => {
+      speechSynthesis.removeEventListener('voiceschanged', initVoices);
+    };
+  }, []);
 
   // Cleanup on unmount
   useEffect(() => {
@@ -947,6 +1255,11 @@ function LanguageBridgeWithVideo() {
       if (peerConnectionRef.current) {
         peerConnectionRef.current.close();
       }
+      
+      // Close audio context
+      if (audioContextRef.current) {
+        audioContextRef.current.close();
+      }
     };
   }, [localStream, remoteStream]);
 
@@ -955,15 +1268,15 @@ function LanguageBridgeWithVideo() {
       fontFamily: 'system-ui, -apple-system, sans-serif',
       minHeight: '100vh',
       background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
-      padding: '20px'
+      padding: isMobile ? '10px' : '20px'
     }}>
       <div style={{ maxWidth: '1200px', margin: '0 auto' }}>
         
         {/* Header */}
-        <div style={{ textAlign: 'center', marginBottom: '30px' }}>
+        <div style={{ textAlign: 'center', marginBottom: isMobile ? '20px' : '30px' }}>
           <h1 style={{
             color: 'white',
-            fontSize: '2.5rem',
+            fontSize: isMobile ? '2rem' : '2.5rem',
             marginBottom: '10px',
             textShadow: '2px 2px 4px rgba(0,0,0,0.3)'
           }}>
@@ -971,22 +1284,31 @@ function LanguageBridgeWithVideo() {
           </h1>
           <p style={{
             color: 'rgba(255,255,255,0.9)',
-            fontSize: '1.1rem'
+            fontSize: isMobile ? '1rem' : '1.1rem'
           }}>
             Real-time voice translation with video chat • Join with a code • Speak naturally
           </p>
+          {isMobile && (
+            <p style={{
+              color: 'rgba(255,255,255,0.8)',
+              fontSize: '0.9rem',
+              marginTop: '10px'
+            }}>
+              📱 Mobile optimized • Best on HTTPS • {isIOS ? 'iOS Safari' : 'Chrome'} recommended
+            </p>
+          )}
         </div>
 
-        {/* Status Bar */}
+        {/* Enhanced Status Bar */}
         <div style={{
           background: 'rgba(255,255,255,0.95)',
           borderRadius: '15px',
-          padding: '15px',
+          padding: isMobile ? '10px' : '15px',
           marginBottom: '20px',
           display: 'flex',
           justifyContent: 'center',
           alignItems: 'center',
-          gap: '20px',
+          gap: isMobile ? '10px' : '20px',
           flexWrap: 'wrap'
         }}>
           <div style={{
@@ -1002,7 +1324,8 @@ function LanguageBridgeWithVideo() {
             color: status === 'online' ? '#166534' : 
                    status === 'listening' ? '#92400e' : 
                    status === 'translating' ? '#3730a3' : 
-                   status === 'error' ? '#dc2626' : '#6b7280'
+                   status === 'error' ? '#dc2626' : '#6b7280',
+            fontSize: isMobile ? '14px' : '16px'
           }}>
             <span>
               {status === 'online' ? '🟢' : 
@@ -1021,9 +1344,10 @@ function LanguageBridgeWithVideo() {
               borderRadius: '20px',
               background: '#e0e7ff',
               color: '#3730a3',
-              fontWeight: 'bold'
+              fontWeight: 'bold',
+              fontSize: isMobile ? '14px' : '16px'
             }}>
-              📋 Code: {currentSessionCode}
+              📋 {currentSessionCode}
             </div>
           )}
           
@@ -1033,9 +1357,10 @@ function LanguageBridgeWithVideo() {
               borderRadius: '20px',
               background: '#ecfdf5',
               color: '#065f46',
-              fontWeight: 'bold'
+              fontWeight: 'bold',
+              fontSize: isMobile ? '14px' : '16px'
             }}>
-              👥 {getOtherUsers().length + 1} connected
+              👥 {getOtherUsers().length + 1} users
             </div>
           )}
 
@@ -1045,9 +1370,10 @@ function LanguageBridgeWithVideo() {
               borderRadius: '20px',
               background: isListening ? '#fef3c7' : '#f3f4f6',
               color: isListening ? '#92400e' : '#6b7280',
-              fontWeight: 'bold'
+              fontWeight: 'bold',
+              fontSize: isMobile ? '14px' : '16px'
             }}>
-              {isListening ? '🎙️ Recording' : '🎙️ Ready'}
+              {isListening ? '🎙️ Live' : '🎙️ Ready'}
             </div>
           )}
 
@@ -1058,7 +1384,10 @@ function LanguageBridgeWithVideo() {
               background: '#f0f9ff',
               color: '#1e40af',
               fontWeight: 'bold',
-              fontSize: '14px'
+              fontSize: isMobile ? '12px' : '14px',
+              maxWidth: isMobile ? '200px' : 'none',
+              overflow: 'hidden',
+              textOverflow: 'ellipsis'
             }}>
               {videoStatus}
             </div>
@@ -1071,9 +1400,22 @@ function LanguageBridgeWithVideo() {
               background: '#fef3c7',
               color: '#92400e',
               fontWeight: 'bold',
-              fontSize: '14px'
+              fontSize: isMobile ? '12px' : '14px'
             }}>
               {translationStatus}
+            </div>
+          )}
+
+          {permissionStatus && (
+            <div style={{
+              padding: '8px 16px',
+              borderRadius: '20px',
+              background: '#ede9fe',
+              color: '#6b21a8',
+              fontWeight: 'bold',
+              fontSize: isMobile ? '12px' : '14px'
+            }}>
+              {permissionStatus}
             </div>
           )}
         </div>
@@ -1083,12 +1425,13 @@ function LanguageBridgeWithVideo() {
           <div style={{
             background: '#fee2e2',
             color: '#dc2626',
-            padding: '16px',
+            padding: isMobile ? '12px' : '16px',
             borderRadius: '12px',
             marginBottom: '20px',
             textAlign: 'center',
             fontWeight: 'bold',
-            border: '2px solid #fca5a5'
+            border: '2px solid #fca5a5',
+            fontSize: isMobile ? '14px' : '16px'
           }}>
             ⚠️ {error}
           </div>
@@ -1099,16 +1442,16 @@ function LanguageBridgeWithVideo() {
           <div style={{
             background: 'rgba(255,255,255,0.95)',
             borderRadius: '20px',
-            padding: '30px',
+            padding: isMobile ? '20px' : '30px',
             marginBottom: '30px'
           }}>
-            <h3 style={{ marginTop: 0, marginBottom: '20px', textAlign: 'center' }}>
+            <h3 style={{ marginTop: 0, marginBottom: '20px', textAlign: 'center', fontSize: isMobile ? '1.2rem' : '1.5rem' }}>
               🚀 Get Started
             </h3>
             
             {/* API Key */}
             <div style={{ marginBottom: '20px' }}>
-              <label style={{ display: 'block', marginBottom: '8px', fontWeight: 'bold' }}>
+              <label style={{ display: 'block', marginBottom: '8px', fontWeight: 'bold', fontSize: isMobile ? '14px' : '16px' }}>
                 🔑 Gemini API Key:
               </label>
               <input
@@ -1118,10 +1461,10 @@ function LanguageBridgeWithVideo() {
                 placeholder="AIzaSy..."
                 style={{
                   width: '100%',
-                  padding: '12px',
+                  padding: isMobile ? '14px' : '12px',
                   borderRadius: '8px',
                   border: '2px solid #d1d5db',
-                  fontSize: '16px',
+                  fontSize: isMobile ? '16px' : '16px', // 16px prevents zoom on iOS
                   boxSizing: 'border-box'
                 }}
               />
@@ -1136,12 +1479,12 @@ function LanguageBridgeWithVideo() {
             {/* User Info */}
             <div style={{
               display: 'grid',
-              gridTemplateColumns: window.innerWidth > 600 ? '1fr 1fr' : '1fr',
+              gridTemplateColumns: (window.innerWidth > 600 && !isMobile) ? '1fr 1fr' : '1fr',
               gap: '15px',
               marginBottom: '20px'
             }}>
               <div>
-                <label style={{ display: 'block', marginBottom: '8px', fontWeight: 'bold' }}>
+                <label style={{ display: 'block', marginBottom: '8px', fontWeight: 'bold', fontSize: isMobile ? '14px' : '16px' }}>
                   👤 Your Name:
                 </label>
                 <input
@@ -1151,7 +1494,7 @@ function LanguageBridgeWithVideo() {
                   placeholder="Enter your name"
                   style={{
                     width: '100%',
-                    padding: '12px',
+                    padding: isMobile ? '14px' : '12px',
                     borderRadius: '8px',
                     border: '2px solid #d1d5db',
                     fontSize: '16px',
@@ -1161,7 +1504,7 @@ function LanguageBridgeWithVideo() {
               </div>
               
               <div>
-                <label style={{ display: 'block', marginBottom: '8px', fontWeight: 'bold' }}>
+                <label style={{ display: 'block', marginBottom: '8px', fontWeight: 'bold', fontSize: isMobile ? '14px' : '16px' }}>
                   🗣️ Your Language:
                 </label>
                 <select
@@ -1169,7 +1512,7 @@ function LanguageBridgeWithVideo() {
                   onChange={(e) => setUserLanguage(e.target.value)}
                   style={{
                     width: '100%',
-                    padding: '12px',
+                    padding: isMobile ? '14px' : '12px',
                     borderRadius: '8px',
                     border: '2px solid #d1d5db',
                     fontSize: '16px',
@@ -1188,7 +1531,7 @@ function LanguageBridgeWithVideo() {
             {/* Media Options */}
             <div style={{
               display: 'flex',
-              gap: '20px',
+              gap: isMobile ? '15px' : '20px',
               marginBottom: '20px',
               justifyContent: 'center',
               flexWrap: 'wrap'
@@ -1198,15 +1541,18 @@ function LanguageBridgeWithVideo() {
                 alignItems: 'center',
                 gap: '8px',
                 cursor: 'pointer',
-                padding: '12px 16px',
+                padding: isMobile ? '14px 16px' : '12px 16px',
                 background: '#f3f4f6',
                 borderRadius: '12px',
-                fontWeight: 'bold'
+                fontWeight: 'bold',
+                fontSize: isMobile ? '14px' : '16px',
+                minHeight: '44px' // Touch-friendly size
               }}>
                 <input
                   type="checkbox"
                   checked={isVideoEnabled}
                   onChange={(e) => setIsVideoEnabled(e.target.checked)}
+                  style={{ transform: isMobile ? 'scale(1.2)' : 'scale(1)' }}
                 />
                 <span>📹 Enable Video</span>
               </label>
@@ -1216,15 +1562,18 @@ function LanguageBridgeWithVideo() {
                 alignItems: 'center',
                 gap: '8px',
                 cursor: 'pointer',
-                padding: '12px 16px',
+                padding: isMobile ? '14px 16px' : '12px 16px',
                 background: '#f3f4f6',
                 borderRadius: '12px',
-                fontWeight: 'bold'
+                fontWeight: 'bold',
+                fontSize: isMobile ? '14px' : '16px',
+                minHeight: '44px'
               }}>
                 <input
                   type="checkbox"
                   checked={isAudioEnabled}
                   onChange={(e) => setIsAudioEnabled(e.target.checked)}
+                  style={{ transform: isMobile ? 'scale(1.2)' : 'scale(1)' }}
                 />
                 <span>🎤 Enable Audio</span>
               </label>
@@ -1233,7 +1582,7 @@ function LanguageBridgeWithVideo() {
             {/* Session Actions */}
             <div style={{
               display: 'grid',
-              gridTemplateColumns: window.innerWidth > 600 ? '1fr 1fr' : '1fr',
+              gridTemplateColumns: (window.innerWidth > 600 && !isMobile) ? '1fr 1fr' : '1fr',
               gap: '20px'
             }}>
               <div>
@@ -1242,7 +1591,7 @@ function LanguageBridgeWithVideo() {
                   disabled={!userName.trim() || !apiKey.trim()}
                   style={{
                     width: '100%',
-                    padding: '16px',
+                    padding: isMobile ? '18px 16px' : '16px',
                     borderRadius: '12px',
                     border: 'none',
                     background: (userName.trim() && apiKey.trim()) 
@@ -1250,9 +1599,10 @@ function LanguageBridgeWithVideo() {
                       : '#d1d5db',
                     color: 'white',
                     fontWeight: 'bold',
-                    fontSize: '16px',
+                    fontSize: isMobile ? '16px' : '16px',
                     cursor: (userName.trim() && apiKey.trim()) ? 'pointer' : 'not-allowed',
-                    transition: 'all 0.2s'
+                    transition: 'all 0.2s',
+                    minHeight: '44px'
                   }}
                 >
                   🚀 Create New Session
@@ -1267,7 +1617,7 @@ function LanguageBridgeWithVideo() {
                   placeholder="Enter session code (e.g., ABC123)"
                   style={{
                     width: '100%',
-                    padding: '12px',
+                    padding: isMobile ? '14px' : '12px',
                     borderRadius: '8px',
                     border: '2px solid #d1d5db',
                     fontSize: '16px',
@@ -1281,7 +1631,7 @@ function LanguageBridgeWithVideo() {
                   disabled={!userName.trim() || !sessionCode.trim() || !apiKey.trim()}
                   style={{
                     width: '100%',
-                    padding: '16px',
+                    padding: isMobile ? '18px 16px' : '16px',
                     borderRadius: '12px',
                     border: 'none',
                     background: (userName.trim() && sessionCode.trim() && apiKey.trim()) 
@@ -1289,9 +1639,10 @@ function LanguageBridgeWithVideo() {
                       : '#d1d5db',
                     color: 'white',
                     fontWeight: 'bold',
-                    fontSize: '16px',
+                    fontSize: isMobile ? '16px' : '16px',
                     cursor: (userName.trim() && sessionCode.trim() && apiKey.trim()) ? 'pointer' : 'not-allowed',
-                    transition: 'all 0.2s'
+                    transition: 'all 0.2s',
+                    minHeight: '44px'
                   }}
                 >
                   🔗 Join Session
@@ -1304,21 +1655,21 @@ function LanguageBridgeWithVideo() {
         {/* Main Interface */}
         {isConnected && (
           <>
-            {/* Video Section */}
+            {/* Enhanced Video Section */}
             {(isVideoEnabled || getOtherUsers().some(u => u.hasVideo)) && (
               <div style={{
                 background: 'rgba(255,255,255,0.95)',
                 borderRadius: '20px',
-                padding: '20px',
+                padding: isMobile ? '15px' : '20px',
                 marginBottom: '20px'
               }}>
-                <h3 style={{ margin: '0 0 15px 0', textAlign: 'center' }}>
-                  📹 Video Chat
+                <h3 style={{ margin: '0 0 15px 0', textAlign: 'center', fontSize: isMobile ? '1.1rem' : '1.3rem' }}>
+                  📹 Video Chat {connectionState && `(${connectionState})`}
                 </h3>
                 <div style={{
                   display: 'grid',
-                  gridTemplateColumns: window.innerWidth > 768 ? '1fr 1fr' : '1fr',
-                  gap: '20px'
+                  gridTemplateColumns: (window.innerWidth > 768 && !isMobile) ? '1fr 1fr' : '1fr',
+                  gap: isMobile ? '15px' : '20px'
                 }}>
                   {/* Local Video */}
                   <div style={{
@@ -1326,7 +1677,8 @@ function LanguageBridgeWithVideo() {
                     background: '#000',
                     borderRadius: '12px',
                     overflow: 'hidden',
-                    aspectRatio: '16/9'
+                    aspectRatio: '16/9',
+                    minHeight: isMobile ? '200px' : 'auto'
                   }}>
                     {localStream ? (
                       <video
@@ -1334,10 +1686,12 @@ function LanguageBridgeWithVideo() {
                         autoPlay
                         muted
                         playsInline
+                        onClick={() => handleVideoClick(localVideoRef)}
                         style={{
                           width: '100%',
                           height: '100%',
-                          objectFit: 'cover'
+                          objectFit: 'cover',
+                          cursor: isMobile ? 'pointer' : 'default'
                         }}
                       />
                     ) : (
@@ -1351,8 +1705,8 @@ function LanguageBridgeWithVideo() {
                         height: '100%'
                       }}>
                         <div>
-                          <div style={{ fontSize: '48px', marginBottom: '10px' }}>📹</div>
-                          <div>Your video will appear here</div>
+                          <div style={{ fontSize: isMobile ? '36px' : '48px', marginBottom: '10px' }}>📹</div>
+                          <div style={{ fontSize: isMobile ? '14px' : '16px' }}>Your video will appear here</div>
                         </div>
                       </div>
                     )}
@@ -1364,7 +1718,7 @@ function LanguageBridgeWithVideo() {
                       color: 'white',
                       padding: '5px 10px',
                       borderRadius: '15px',
-                      fontSize: '14px',
+                      fontSize: isMobile ? '12px' : '14px',
                       fontWeight: 'bold'
                     }}>
                       You ({languages.find(l => l.code === userLanguage)?.flag})
@@ -1380,17 +1734,20 @@ function LanguageBridgeWithVideo() {
                     aspectRatio: '16/9',
                     display: 'flex',
                     alignItems: 'center',
-                    justifyContent: 'center'
+                    justifyContent: 'center',
+                    minHeight: isMobile ? '200px' : 'auto'
                   }}>
                     {remoteStream ? (
                       <video
                         ref={remoteVideoRef}
                         autoPlay
                         playsInline
+                        onClick={() => handleVideoClick(remoteVideoRef)}
                         style={{
                           width: '100%',
                           height: '100%',
-                          objectFit: 'cover'
+                          objectFit: 'cover',
+                          cursor: isMobile ? 'pointer' : 'default'
                         }}
                       />
                     ) : (
@@ -1399,10 +1756,10 @@ function LanguageBridgeWithVideo() {
                         textAlign: 'center',
                         padding: '20px'
                       }}>
-                        <div style={{ fontSize: '48px', marginBottom: '10px' }}>👤</div>
-                        <div>
+                        <div style={{ fontSize: isMobile ? '36px' : '48px', marginBottom: '10px' }}>👤</div>
+                        <div style={{ fontSize: isMobile ? '14px' : '16px' }}>
                           {getOtherUsers().some(u => u.hasVideo) 
-                            ? 'Connecting to remote video...' 
+                            ? (isMobile ? 'Tap to play when connected' : 'Connecting to remote video...') 
                             : 'Waiting for other users to enable video...'}
                         </div>
                       </div>
@@ -1416,7 +1773,7 @@ function LanguageBridgeWithVideo() {
                         color: 'white',
                         padding: '5px 10px',
                         borderRadius: '15px',
-                        fontSize: '14px',
+                        fontSize: isMobile ? '12px' : '14px',
                         fontWeight: 'bold'
                       }}>
                         {getOtherUsers()[0].name} ({languages.find(l => l.code === getOtherUsers()[0].language)?.flag})
@@ -1427,11 +1784,11 @@ function LanguageBridgeWithVideo() {
               </div>
             )}
 
-            {/* Controls */}
+            {/* Enhanced Controls */}
             <div style={{
               background: 'rgba(255,255,255,0.95)',
               borderRadius: '20px',
-              padding: '20px',
+              padding: isMobile ? '15px' : '20px',
               marginBottom: '20px'
             }}>
               <div style={{
@@ -1439,14 +1796,20 @@ function LanguageBridgeWithVideo() {
                 justifyContent: 'space-between',
                 alignItems: 'center',
                 flexWrap: 'wrap',
-                gap: '15px'
+                gap: isMobile ? '10px' : '15px'
               }}>
-                <div style={{ display: 'flex', gap: '15px', flexWrap: 'wrap' }}>
+                <div style={{ 
+                  display: 'flex', 
+                  gap: isMobile ? '10px' : '15px', 
+                  flexWrap: 'wrap',
+                  justifyContent: 'center',
+                  width: isMobile ? '100%' : 'auto'
+                }}>
                   <button
                     onClick={isListening ? stopListening : startListening}
                     disabled={getOtherUsers().length === 0}
                     style={{
-                      padding: '12px 24px',
+                      padding: isMobile ? '14px 20px' : '12px 24px',
                       borderRadius: '12px',
                       border: 'none',
                       background: getOtherUsers().length === 0 ? '#d1d5db' :
@@ -1455,43 +1818,51 @@ function LanguageBridgeWithVideo() {
                       color: 'white',
                       fontWeight: 'bold',
                       cursor: getOtherUsers().length === 0 ? 'not-allowed' : 'pointer',
-                      fontSize: '16px',
-                      transition: 'all 0.2s'
+                      fontSize: isMobile ? '14px' : '16px',
+                      transition: 'all 0.2s',
+                      minHeight: '44px',
+                      flexShrink: 0
                     }}
                   >
-                    {isListening ? '🛑 Stop Listening' : '🎤 Start Listening'}
+                    {isListening ? '🛑 Stop' : '🎤 Listen'}
                   </button>
 
                   <button
                     onClick={toggleVideo}
                     style={{
-                      padding: '12px 20px',
+                      padding: isMobile ? '14px 18px' : '12px 20px',
                       borderRadius: '12px',
                       border: 'none',
                       background: isVideoEnabled ? '#10b981' : '#6b7280',
                       color: 'white',
                       fontWeight: 'bold',
                       cursor: 'pointer',
-                      transition: 'all 0.2s'
+                      transition: 'all 0.2s',
+                      fontSize: isMobile ? '14px' : '16px',
+                      minHeight: '44px',
+                      flexShrink: 0
                     }}
                   >
-                    {isVideoEnabled ? '📹 Video On' : '📹 Video Off'}
+                    📹 {isVideoEnabled ? 'On' : 'Off'}
                   </button>
                   
                   <button
                     onClick={() => setIsMuted(!isMuted)}
                     style={{
-                      padding: '12px 20px',
+                      padding: isMobile ? '14px 18px' : '12px 20px',
                       borderRadius: '12px',
                       border: 'none',
                       background: isMuted ? '#ef4444' : '#3b82f6',
                       color: 'white',
                       fontWeight: 'bold',
                       cursor: 'pointer',
-                      transition: 'all 0.2s'
+                      transition: 'all 0.2s',
+                      fontSize: isMobile ? '14px' : '16px',
+                      minHeight: '44px',
+                      flexShrink: 0
                     }}
                   >
-                    {isMuted ? '🔇 Muted' : '🔊 Audio On'}
+                    {isMuted ? '🔇' : '🔊'}
                   </button>
                   
                   <label style={{
@@ -1499,74 +1870,100 @@ function LanguageBridgeWithVideo() {
                     alignItems: 'center',
                     gap: '8px',
                     cursor: 'pointer',
-                    padding: '12px 16px',
+                    padding: isMobile ? '14px 16px' : '12px 16px',
                     background: autoSpeak ? '#dcfce7' : '#f3f4f6',
                     borderRadius: '12px',
                     fontWeight: 'bold',
-                    color: autoSpeak ? '#166534' : '#6b7280'
+                    color: autoSpeak ? '#166534' : '#6b7280',
+                    fontSize: isMobile ? '14px' : '16px',
+                    minHeight: '44px',
+                    flexShrink: 0
                   }}>
                     <input
                       type="checkbox"
                       checked={autoSpeak}
                       onChange={(e) => setAutoSpeak(e.target.checked)}
+                      style={{ transform: isMobile ? 'scale(1.2)' : 'scale(1)' }}
                     />
-                    <span>🗣️ Auto-speak</span>
+                    <span>🗣️ Auto</span>
                   </label>
 
                   <button
                     onClick={clearTranscripts}
                     style={{
-                      padding: '12px 20px',
+                      padding: isMobile ? '14px 18px' : '12px 20px',
                       borderRadius: '12px',
                       border: '2px solid #f59e0b',
                       background: 'transparent',
                       color: '#f59e0b',
                       fontWeight: 'bold',
                       cursor: 'pointer',
-                      transition: 'all 0.2s'
+                      transition: 'all 0.2s',
+                      fontSize: isMobile ? '14px' : '16px',
+                      minHeight: '44px',
+                      flexShrink: 0
                     }}
                   >
-                    🗑️ Clear
+                    🗑️
                   </button>
                 </div>
                 
                 <button
                   onClick={leaveSession}
                   style={{
-                    padding: '12px 20px',
+                    padding: isMobile ? '14px 18px' : '12px 20px',
                     borderRadius: '12px',
                     border: '2px solid #dc2626',
                     background: 'transparent',
                     color: '#dc2626',
                     fontWeight: 'bold',
                     cursor: 'pointer',
-                    transition: 'all 0.2s'
+                    transition: 'all 0.2s',
+                    fontSize: isMobile ? '14px' : '16px',
+                    minHeight: '44px',
+                    width: isMobile ? '100%' : 'auto',
+                    marginTop: isMobile ? '10px' : '0'
                   }}
                 >
-                  🚪 Leave Session
+                  🚪 Leave
                 </button>
               </div>
               
               {getOtherUsers().length === 0 && (
                 <div style={{
                   marginTop: '15px',
-                  padding: '10px',
+                  padding: isMobile ? '12px' : '10px',
                   background: '#fef3c7',
                   borderRadius: '8px',
                   color: '#92400e',
                   textAlign: 'center',
-                  fontSize: '14px',
+                  fontSize: isMobile ? '14px' : '14px',
                   fontWeight: 'bold'
                 }}>
                   ⏳ Waiting for other users to join for translation...
                 </div>
               )}
+              
+              {isMobile && isListening && (
+                <div style={{
+                  marginTop: '15px',
+                  padding: '12px',
+                  background: '#e0e7ff',
+                  borderRadius: '8px',
+                  color: '#3730a3',
+                  textAlign: 'center',
+                  fontSize: '14px',
+                  fontWeight: 'bold'
+                }}>
+                  📱 Tap "Stop" to pause listening (saves battery)
+                </div>
+              )}
             </div>
 
-            {/* Communication Interface */}
+            {/* Enhanced Communication Interface */}
             <div style={{
               display: 'grid',
-              gridTemplateColumns: window.innerWidth > 768 ? '1fr 1fr' : '1fr',
+              gridTemplateColumns: (window.innerWidth > 768 && !isMobile) ? '1fr 1fr' : '1fr',
               gap: '20px',
               marginBottom: '20px'
             }}>
@@ -1574,14 +1971,15 @@ function LanguageBridgeWithVideo() {
               <div style={{
                 background: 'rgba(255,255,255,0.95)',
                 borderRadius: '15px',
-                padding: '20px'
+                padding: isMobile ? '15px' : '20px'
               }}>
                 <h3 style={{
                   margin: '0 0 15px 0',
                   color: '#3b82f6',
                   display: 'flex',
                   alignItems: 'center',
-                  gap: '8px'
+                  gap: '8px',
+                  fontSize: isMobile ? '1rem' : '1.2rem'
                 }}>
                   🗣️ You speak {languages.find(l => l.code === userLanguage)?.native}
                   {isListening && (
@@ -1593,17 +1991,17 @@ function LanguageBridgeWithVideo() {
                       fontSize: '12px',
                       animation: 'pulse 2s infinite'
                     }}>
-                      LISTENING
+                      LIVE
                     </span>
                   )}
                 </h3>
                 <div style={{
                   background: '#f0f9ff',
                   borderRadius: '12px',
-                  padding: '20px',
-                  minHeight: '120px',
+                  padding: isMobile ? '15px' : '20px',
+                  minHeight: isMobile ? '100px' : '120px',
                   border: '2px solid #0ea5e9',
-                  fontSize: '16px',
+                  fontSize: isMobile ? '14px' : '16px',
                   lineHeight: '1.6',
                   maxHeight: '200px',
                   overflowY: 'auto'
@@ -1613,7 +2011,7 @@ function LanguageBridgeWithVideo() {
                       {isListening 
                         ? `🎤 Listening... Speak in ${languages.find(l => l.code === userLanguage)?.native}` 
                         : getOtherUsers().length > 0 
-                          ? 'Click "Start Listening" to begin speaking...'
+                          ? 'Click "Listen" to start speaking...'
                           : 'Waiting for other users to join...'}
                     </span>
                   )}
@@ -1623,14 +2021,16 @@ function LanguageBridgeWithVideo() {
                     onClick={() => speakText(myTranscript, userLanguage)}
                     disabled={!myTranscript.trim()}
                     style={{
-                      padding: '8px 16px',
+                      padding: isMobile ? '10px 16px' : '8px 16px',
                       borderRadius: '8px',
                       border: 'none',
                       background: myTranscript.trim() ? '#10b981' : '#d1d5db',
                       color: 'white',
                       fontWeight: 'bold',
                       cursor: myTranscript.trim() ? 'pointer' : 'not-allowed',
-                      transition: 'all 0.2s'
+                      transition: 'all 0.2s',
+                      fontSize: isMobile ? '14px' : '14px',
+                      minHeight: '40px'
                     }}
                   >
                     🔊 Repeat
@@ -1642,14 +2042,15 @@ function LanguageBridgeWithVideo() {
               <div style={{
                 background: 'rgba(255,255,255,0.95)',
                 borderRadius: '15px',
-                padding: '20px'
+                padding: isMobile ? '15px' : '20px'
               }}>
                 <h3 style={{
                   margin: '0 0 15px 0',
                   color: '#10b981',
                   display: 'flex',
                   alignItems: 'center',
-                  gap: '8px'
+                  gap: '8px',
+                  fontSize: isMobile ? '1rem' : '1.2rem'
                 }}>
                   👂 You hear {languages.find(l => l.code === userLanguage)?.native}
                   {autoSpeak && (
@@ -1660,17 +2061,17 @@ function LanguageBridgeWithVideo() {
                       borderRadius: '12px',
                       fontSize: '12px'
                     }}>
-                      AUTO-SPEAK
+                      AUTO
                     </span>
                   )}
                 </h3>
                 <div style={{
                   background: '#ecfdf5',
                   borderRadius: '12px',
-                  padding: '20px',
-                  minHeight: '120px',
+                  padding: isMobile ? '15px' : '20px',
+                  minHeight: isMobile ? '100px' : '120px',
                   border: '2px solid #a7f3d0',
-                  fontSize: '16px',
+                  fontSize: isMobile ? '14px' : '16px',
                   lineHeight: '1.6',
                   maxHeight: '200px',
                   overflowY: 'auto'
@@ -1686,14 +2087,16 @@ function LanguageBridgeWithVideo() {
                     onClick={() => speakText(receivedTranscript, userLanguage)}
                     disabled={!receivedTranscript.trim()}
                     style={{
-                      padding: '8px 16px',
+                      padding: isMobile ? '10px 16px' : '8px 16px',
                       borderRadius: '8px',
                       border: 'none',
                       background: receivedTranscript.trim() ? '#10b981' : '#d1d5db',
                       color: 'white',
                       fontWeight: 'bold',
                       cursor: receivedTranscript.trim() ? 'pointer' : 'not-allowed',
-                      transition: 'all 0.2s'
+                      transition: 'all 0.2s',
+                      fontSize: isMobile ? '14px' : '14px',
+                      minHeight: '40px'
                     }}
                   >
                     🔊 Repeat
@@ -1706,15 +2109,15 @@ function LanguageBridgeWithVideo() {
             <div style={{
               background: 'rgba(255,255,255,0.95)',
               borderRadius: '15px',
-              padding: '20px',
+              padding: isMobile ? '15px' : '20px',
               marginBottom: '20px'
             }}>
-              <h3 style={{ margin: '0 0 15px 0', textAlign: 'center' }}>
+              <h3 style={{ margin: '0 0 15px 0', textAlign: 'center', fontSize: isMobile ? '1.1rem' : '1.3rem' }}>
                 👥 Connected Users ({Object.keys(connectedUsers).length})
               </h3>
               <div style={{
                 display: 'grid',
-                gridTemplateColumns: 'repeat(auto-fit, minmax(250px, 1fr))',
+                gridTemplateColumns: isMobile ? '1fr' : 'repeat(auto-fit, minmax(250px, 1fr))',
                 gap: '15px'
               }}>
                 {Object.values(connectedUsers).map((user) => (
@@ -1728,23 +2131,25 @@ function LanguageBridgeWithVideo() {
                     <div style={{ 
                       fontWeight: 'bold', 
                       marginBottom: '8px',
-                      fontSize: '16px'
+                      fontSize: isMobile ? '15px' : '16px'
                     }}>
                       {user.name} {user.id === userId && '(You)'}
                     </div>
                     <div style={{ 
-                      fontSize: '14px', 
+                      fontSize: isMobile ? '13px' : '14px', 
                       color: '#6b7280',
                       marginBottom: '8px'
                     }}>
                       {languages.find(l => l.code === user.language)?.flag} {' '}
                       {languages.find(l => l.code === user.language)?.native}
+                      {user.deviceInfo?.isMobile && ' 📱'}
                     </div>
                     <div style={{
                       display: 'flex',
                       justifyContent: 'center',
                       gap: '8px',
-                      marginBottom: '8px'
+                      marginBottom: '8px',
+                      flexWrap: 'wrap'
                     }}>
                       {user.hasVideo && (
                         <span style={{
@@ -1791,13 +2196,13 @@ function LanguageBridgeWithVideo() {
               <div style={{
                 background: 'rgba(255,255,255,0.95)',
                 borderRadius: '15px',
-                padding: '20px'
+                padding: isMobile ? '15px' : '20px'
               }}>
-                <h3 style={{ margin: '0 0 15px 0', textAlign: 'center' }}>
+                <h3 style={{ margin: '0 0 15px 0', textAlign: 'center', fontSize: isMobile ? '1.1rem' : '1.3rem' }}>
                   💬 Conversation History ({messages.length} messages)
                 </h3>
                 <div style={{
-                  maxHeight: '300px',
+                  maxHeight: isMobile ? '250px' : '300px',
                   overflowY: 'auto',
                   background: '#f8fafc',
                   borderRadius: '12px',
@@ -1815,29 +2220,30 @@ function LanguageBridgeWithVideo() {
                         fontWeight: 'bold',
                         color: msg.senderId === userId ? '#1e40af' : '#065f46',
                         marginBottom: '8px',
-                        fontSize: '14px',
+                        fontSize: isMobile ? '13px' : '14px',
                         display: 'flex',
                         justifyContent: 'space-between',
-                        alignItems: 'center'
+                        alignItems: 'center',
+                        flexWrap: 'wrap'
                       }}>
                         <span>{msg.senderName}:</span>
                         <span style={{ fontSize: '12px', fontWeight: 'normal', opacity: 0.7 }}>
                           {msg.timestamp ? new Date(msg.timestamp).toLocaleTimeString() : 'Now'}
                         </span>
                       </div>
-                      <div style={{ marginBottom: '8px', fontSize: '15px' }}>
+                      <div style={{ marginBottom: '8px', fontSize: isMobile ? '14px' : '15px' }}>
                         "{msg.originalText}"
                       </div>
                       {msg.translatedTexts && (
                         <div style={{
-                          fontSize: '13px',
+                          fontSize: isMobile ? '12px' : '13px',
                           color: '#6b7280',
                           fontStyle: 'italic',
                           paddingTop: '8px',
                           borderTop: '1px solid #e5e7eb'
                         }}>
                           {Object.entries(msg.translatedTexts).map(([lang, translation]) => (
-                            <div key={lang}>
+                            <div key={lang} style={{ marginBottom: '2px' }}>
                               🔄 {languages.find(l => l.code === lang)?.flag} "{translation}"
                             </div>
                           ))}
@@ -1855,16 +2261,17 @@ function LanguageBridgeWithVideo() {
         <div style={{
           background: 'rgba(255,255,255,0.9)',
           borderRadius: '15px',
-          padding: '15px',
+          padding: isMobile ? '12px' : '15px',
           marginTop: '20px',
           textAlign: 'center',
-          fontSize: '14px',
+          fontSize: isMobile ? '12px' : '14px',
           color: '#6b7280'
         }}>
           <strong>🌍 Real-time language translation with video chat</strong> powered by Gemini AI
           <br />
-          <span style={{ fontSize: '12px' }}>
+          <span style={{ fontSize: isMobile ? '11px' : '12px' }}>
             Enhanced with WebRTC for video calling • Works best in Chrome/Edge browsers
+            {isMobile && ' • Mobile optimized for touch'}
           </span>
         </div>
 
