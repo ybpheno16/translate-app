@@ -6,15 +6,15 @@ import { getDatabase, ref, push, set, onValue, update, remove, serverTimestamp }
 
 // Firebase configuration
 const firebaseConfig = {
-  apiKey: "AIzaSyDVXUVwiel_rb1Z7T4xFktArycVvjc1Nfs",
-  authDomain: "voicetranslate-e446d.firebaseapp.com",
-  databaseURL: "https://voicetranslate-e446d-default-rtdb.firebaseio.com",
-  projectId: "voicetranslate-e446d",
-  storageBucket: "voicetranslate-e446d.firebasestorage.app",
-  messagingSenderId: "672126549267",
-  appId: "1:672126549267:web:ebd535ac880aead5242ee6",
-  measurementId: "G-L8DTTXJGJN"
+  apiKey: "AIzaSyDl6VgOr-sT3JhCVAnJQBG0JWUqqTC09l0",
+  authDomain: "voicetranslate-db5cc.firebaseapp.com",
+  projectId: "voicetranslate-db5cc",
+  storageBucket: "voicetranslate-db5cc.firebasestorage.app",
+  messagingSenderId: "950768498095",
+  appId: "1:950768498095:web:7c00fc79014d00e1b36b5a",
+  measurementId: "G-045GJFBMV1"
 };
+
 
 // Initialize Firebase
 const app = initializeApp(firebaseConfig);
@@ -1873,7 +1873,7 @@ function PremiumLanguageBridge() {
                       e.target.style.boxShadow = 'none';
                     }}
                   >
-                    {isListening ? 'Stop' : 'Listen'}
+                    {isListening ? 'Stop' : 'Speak'}
                   </button>
 
                   <button
